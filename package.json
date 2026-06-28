@@ -1,0 +1,59 @@
+{
+  "name": "agent-run-cache",
+  "version": "2.1.0",
+  "description": "Local run cache and terminal companion for GitHub Copilot CLI.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AyubMoh1/arc-copilot.git"
+  },
+  "bugs": {
+    "url": "https://github.com/AyubMoh1/arc-copilot/issues"
+  },
+  "homepage": "https://github.com/AyubMoh1/arc-copilot#readme",
+  "type": "module",
+  "bin": {
+    "arc": "./bin/arc",
+    "agent-run-cache": "./bin/arc"
+  },
+  "files": [
+    "bin",
+    "Cargo.toml",
+    "Cargo.lock",
+    "prebuilds",
+    "assets",
+    "rust",
+    "plugin",
+    "licenses/ZELLIJ-MIT.txt",
+    "patches/zellij-0.44.3-arc-appliance.patch",
+    "scripts/install-rust-binary.cjs",
+    "scripts/build-release-binaries.cjs",
+    "scripts/build-zellij-appliance.cjs",
+    "scripts/verify-rust-local-embeddings.cjs",
+    "NOTICE",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/install-rust-binary.cjs",
+    "build:rust": "node scripts/install-rust-binary.cjs",
+    "build:release": "node scripts/build-release-binaries.cjs",
+    "build:ts": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc && chmod +x dist/cli.js",
+    "prepare": "node scripts/install-rust-binary.cjs --prepare",
+    "postinstall": "node scripts/install-rust-binary.cjs --postinstall",
+    "test": "npm run build:ts && node --test test/*.test.js",
+    "verify:local-embeddings": "npm run build:ts && node scripts/verify-local-embeddings.mjs",
+    "verify:rust-local-embeddings": "node scripts/verify-rust-local-embeddings.cjs",
+    "reset": "bin/arc reset --yes",
+    "smoke": "npm run build:rust && bin/arc smoke"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "Apache-2.0",
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "ink": "^7.1.0",
+    "ink-testing-library": "^4.0.0",
+    "react": "^19.2.7",
+    "typescript": "^6.0.3"
+  }
+}

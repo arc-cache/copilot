@@ -1,0 +1,17 @@
+{
+  "name": "agent-run-cache",
+  "description": "Local ARC hooks and MCP tools for recalling verified coding-agent run methods.",
+  "version": "2.1.0",
+  "author": {
+    "name": "Agent Run Cache"
+  },
+  "license": "Apache-2.0",
+  "keywords": [
+    "copilot-cli",
+    "hooks",
+    "mcp",
+    "local-cache"
+  ],
+  "hooks": "hooks.json",
+  "mcpServers": ".mcp.json"
+}

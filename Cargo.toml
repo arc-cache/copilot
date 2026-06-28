@@ -1,0 +1,30 @@
+[package]
+name = "agent-run-cache-rust"
+version = "2.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "Rust binary port of Agent Run Cache."
+
+[[bin]]
+name = "arc"
+path = "rust/src/main.rs"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive"] }
+crossterm = "0.28"
+hex = "0.4"
+rand = "0.8"
+regex = "1.11"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+sha2 = "0.10"
+sysinfo = "0.37"
+ureq = { version = "2.12", features = ["json"] }
+uuid = { version = "1.11", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.14"

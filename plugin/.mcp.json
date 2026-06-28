@@ -1,0 +1,24 @@
+{
+  "mcpServers": {
+    "arc": {
+      "type": "stdio",
+      "command": "arc",
+      "args": [
+        "mcp"
+      ],
+      "tools": [
+        "arc_search",
+        "arc_status",
+        "arc_capsule",
+        "arc_pause",
+        "arc_resume",
+        "arc_set_judge",
+        "arc_list_judges",
+        "arc_delete_capsule",
+        "arc_share_capsule"
+      ],
+      "deferTools": "never",
+      "timeout": 10000
+    }
+  }
+}

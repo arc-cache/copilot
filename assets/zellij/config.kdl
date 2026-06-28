@@ -1,0 +1,163 @@
+default_mode "locked"
+mouse_mode true
+mouse_click_through true
+focus_follows_mouse false
+advanced_mouse_actions true
+mouse_hover_effects false
+copy_clipboard "system"
+copy_on_select false
+pane_frames true
+on_force_close "quit"
+auto_layout false
+stacked_resize false
+show_startup_tips false
+show_release_notes false
+session_serialization false
+osc8_hyperlinks false
+visual_bell false
+web_sharing "disabled"
+theme "arc-appliance"
+
+keybinds clear-defaults=true {
+    locked {
+        bind "Ctrl q" { Quit; }
+    }
+}
+
+load_plugins {}
+
+ui {
+    pane_frames {
+        rounded_corners false
+        hide_session_name true
+    }
+}
+
+themes {
+    arc-appliance {
+        text_unselected {
+            base 205 207 211
+            background 30 32 36
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        text_selected {
+            base 225 227 230
+            background 40 43 48
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        ribbon_selected {
+            base 30 32 36
+            background 104 157 181
+            emphasis_0 190 102 102
+            emphasis_1 180 145 105
+            emphasis_2 150 132 174
+            emphasis_3 104 157 181
+        }
+        ribbon_unselected {
+            base 30 32 36
+            background 155 159 166
+            emphasis_0 190 102 102
+            emphasis_1 205 207 211
+            emphasis_2 104 157 181
+            emphasis_3 150 132 174
+        }
+        table_title {
+            base 104 157 181
+            background 0
+            emphasis_0 180 145 105
+            emphasis_1 126 157 121
+            emphasis_2 104 157 181
+            emphasis_3 150 132 174
+        }
+        table_cell_selected {
+            base 225 227 230
+            background 40 43 48
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        table_cell_unselected {
+            base 205 207 211
+            background 30 32 36
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        list_selected {
+            base 225 227 230
+            background 40 43 48
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        list_unselected {
+            base 205 207 211
+            background 30 32 36
+            emphasis_0 180 145 105
+            emphasis_1 104 157 181
+            emphasis_2 126 157 121
+            emphasis_3 150 132 174
+        }
+        frame_unselected {
+            base 84 88 94
+            background 0
+            emphasis_0 84 88 94
+            emphasis_1 84 88 94
+            emphasis_2 84 88 94
+            emphasis_3 84 88 94
+        }
+        frame_selected {
+            base 104 157 181
+            background 0
+            emphasis_0 104 157 181
+            emphasis_1 104 157 181
+            emphasis_2 104 157 181
+            emphasis_3 104 157 181
+        }
+        frame_highlight {
+            base 104 157 181
+            background 0
+            emphasis_0 104 157 181
+            emphasis_1 104 157 181
+            emphasis_2 104 157 181
+            emphasis_3 104 157 181
+        }
+        exit_code_success {
+            base 126 157 121
+            background 0
+            emphasis_0 104 157 181
+            emphasis_1 30 32 36
+            emphasis_2 150 132 174
+            emphasis_3 104 157 181
+        }
+        exit_code_error {
+            base 190 102 102
+            background 0
+            emphasis_0 180 145 105
+            emphasis_1 0
+            emphasis_2 0
+            emphasis_3 0
+        }
+        multiplayer_user_colors {
+            player_1 150 132 174
+            player_2 104 157 181
+            player_3 126 157 121
+            player_4 180 145 105
+            player_5 104 157 181
+            player_6 155 159 166
+            player_7 190 102 102
+            player_8 126 157 121
+            player_9 150 132 174
+            player_10 180 145 105
+        }
+    }
+}

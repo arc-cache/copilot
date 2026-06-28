@@ -1,0 +1,41 @@
+diff --git a/zellij-server/src/tab/mouse_handler.rs b/zellij-server/src/tab/mouse_handler.rs
+index 97f4ce2..6334541 100644
+--- a/zellij-server/src/tab/mouse_handler.rs
++++ b/zellij-server/src/tab/mouse_handler.rs
+@@ -1230,6 +1230,10 @@ impl MouseHandler {
+             });
+         }
+ 
++        if event.alt && std::env::var_os("ARC_ZELLIJ_APPLIANCE").is_some() {
++            return Ok(MouseAction::NoAction);
++        }
++
+         if event.alt {
+             let is_left_press = event.left && event.event_type == MouseEventType::Press;
+             let is_left_motion = event.left && event.event_type == MouseEventType::Motion;
+diff --git a/zellij-utils/src/consts.rs b/zellij-utils/src/consts.rs
+index 0e8b511..01a591b 100644
+--- a/zellij-utils/src/consts.rs
++++ b/zellij-utils/src/consts.rs
+@@ -10,7 +10,7 @@ use uuid::Uuid;
+ pub const ZELLIJ_CONFIG_FILE_ENV: &str = "ZELLIJ_CONFIG_FILE";
+ pub const ZELLIJ_CONFIG_DIR_ENV: &str = "ZELLIJ_CONFIG_DIR";
+ pub const ZELLIJ_LAYOUT_DIR_ENV: &str = "ZELLIJ_LAYOUT_DIR";
+-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
++pub const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), "-arc-appliance.1");
+ pub const DEFAULT_SCROLL_BUFFER_SIZE: usize = 10_000;
+ pub static SCROLL_BUFFER_SIZE: OnceLock<usize> = OnceLock::new();
+ pub static DEBUG_MODE: OnceLock<bool> = OnceLock::new();
+diff --git a/zellij-utils/src/cli.rs b/zellij-utils/src/cli.rs
+index 5b16917..d56559a 100644
+--- a/zellij-utils/src/cli.rs
++++ b/zellij-utils/src/cli.rs
+@@ -35,7 +35,7 @@ fn validate_session(name: &str) -> Result<String, String> {
+ }
+ 
+ #[derive(Parser, Default, Debug, Clone, Serialize, Deserialize)]
+-#[clap(version, name = "zellij")]
++#[clap(version = "0.44.3-arc-appliance.1", name = "zellij")]
+ pub struct CliArgs {
+     /// Maximum panes on screen, caution: opening more panes will close old ones
+     #[clap(long, value_parser)]

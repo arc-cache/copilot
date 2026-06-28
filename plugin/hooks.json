@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "command": "arc hook copilot SessionStart",
+        "timeoutSec": 20,
+        "env": {
+          "AGENT_RUN_CACHE_COPILOT_PLUGIN": "1"
+        }
+      }
+    ],
+    "userPromptSubmitted": [
+      {
+        "type": "command",
+        "command": "arc hook copilot UserPromptSubmit",
+        "timeoutSec": 20,
+        "env": {
+          "AGENT_RUN_CACHE_COPILOT_PLUGIN": "1"
+        }
+      }
+    ],
+    "sessionEnd": [
+      {
+        "type": "command",
+        "command": "arc hook copilot SessionEnd",
+        "timeoutSec": 20,
+        "env": {
+          "AGENT_RUN_CACHE_COPILOT_PLUGIN": "1"
+        }
+      }
+    ]
+  }
+}
