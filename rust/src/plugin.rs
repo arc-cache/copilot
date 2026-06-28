@@ -846,9 +846,34 @@ pub(crate) fn current_runtime() -> Value {
     json!({
         "node": Value::Null,
         "entrypoint": current_exe_string(),
-        "packageRoot": env!("CARGO_MANIFEST_DIR"),
+        "packageRoot": current_package_root(),
         "transient": false
     })
+}
+
+fn current_package_root() -> PathBuf {
+    env::current_exe()
+        .ok()
+        .and_then(|executable| package_root_for_runtime_executable(&executable))
+        .or_else(|| env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn package_root_for_runtime_executable(executable: &Path) -> Option<PathBuf> {
+    package_root_for_executable(executable).or_else(|| {
+        fs::canonicalize(executable)
+            .ok()
+            .and_then(|resolved| package_root_for_executable(&resolved))
+    })
+}
+
+fn package_root_for_executable(executable: &Path) -> Option<PathBuf> {
+    let bin = executable.parent()?;
+    if bin.file_name()? != "bin" {
+        return None;
+    }
+    let root = bin.parent()?;
+    root.join("plugin").is_dir().then(|| root.to_path_buf())
 }
 
 pub(crate) fn write_activation(workspace: &Path, integration: &str) -> Result<()> {
@@ -901,4 +926,45 @@ pub(crate) fn copilot_plugin_workspace_path() -> PathBuf {
 
 fn resolve_arc_on_path() -> bool {
     command_exists(if cfg!(windows) { "arc.exe" } else { "arc" }) || command_exists("arc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn installed_runtime_uses_the_package_above_bin() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("agent-run-cache");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::create_dir_all(root.join("plugin")).unwrap();
+
+        assert_eq!(
+            package_root_for_executable(&root.join("bin").join("arc")),
+            Some(root)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn installed_runtime_follows_the_global_arc_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("agent-run-cache");
+        let executable = root.join("bin").join("arc");
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::create_dir_all(root.join("plugin")).unwrap();
+        fs::write(&executable, "").unwrap();
+
+        let global_bin = temp.path().join("global").join("bin");
+        fs::create_dir_all(&global_bin).unwrap();
+        let global_arc = global_bin.join("arc");
+        symlink(&executable, &global_arc).unwrap();
+
+        assert_eq!(
+            package_root_for_runtime_executable(&global_arc),
+            Some(fs::canonicalize(root).unwrap())
+        );
+    }
 }
