@@ -1,15 +1,15 @@
 {
-  "name": "agent-run-cache",
+  "name": "arc-copilot",
   "version": "2.1.0",
   "description": "Local run cache and terminal companion for GitHub Copilot CLI.",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AyubMoh1/arc-copilot.git"
+    "url": "git+https://github.com/arc-cache/copilot.git"
   },
   "bugs": {
-    "url": "https://github.com/AyubMoh1/arc-copilot/issues"
+    "url": "https://github.com/arc-cache/copilot/issues"
   },
-  "homepage": "https://github.com/AyubMoh1/arc-copilot#readme",
+  "homepage": "https://github.com/arc-cache/copilot#readme",
   "type": "module",
   "bin": {
     "arc": "./bin/arc",

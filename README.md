@@ -3,7 +3,7 @@
 > ARC watches a coding agent solve something in your repo, keeps the route that
 > actually worked, and hands it back before the next similar run.
 
-[![Latest release](https://img.shields.io/github/v/release/AyubMoh1/arc-copilot?label=release)](https://github.com/AyubMoh1/arc-copilot/releases/latest)
+[![Latest release](https://img.shields.io/github/v/release/arc-cache/copilot?label=release)](https://github.com/arc-cache/copilot/releases/latest)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
 ARC for Copilot is a local-first run cache and terminal companion for GitHub
@@ -15,7 +15,7 @@ The production Copilot integration is a Copilot plugin. The plugin declares ARC
 hooks and an ARC MCP server, both pointing back to the installed `arc` binary:
 
 ```bash
-npm i -g agent-run-cache
+npm i -g arc-copilot
 arc setup
 arc split
 ```
