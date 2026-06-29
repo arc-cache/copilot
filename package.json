@@ -19,7 +19,6 @@
     "bin",
     "Cargo.toml",
     "Cargo.lock",
-    "prebuilds",
     "assets",
     "rust",
     "plugin",
@@ -36,6 +35,7 @@
     "build": "node scripts/install-rust-binary.cjs",
     "build:rust": "node scripts/install-rust-binary.cjs",
     "build:release": "node scripts/build-release-binaries.cjs",
+    "build:npm": "node scripts/build-npm-packages.cjs",
     "build:ts": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc && chmod +x dist/cli.js",
     "prepare": "node scripts/install-rust-binary.cjs --prepare",
     "postinstall": "node scripts/install-rust-binary.cjs --postinstall",
@@ -49,6 +49,13 @@
     "node": ">=22"
   },
   "license": "Apache-2.0",
+  "optionalDependencies": {
+    "arc-copilot-darwin-arm64": "2.1.0",
+    "arc-copilot-darwin-x64": "2.1.0",
+    "arc-copilot-linux-x64": "2.1.0",
+    "arc-copilot-linux-arm64": "2.1.0",
+    "arc-copilot-windows-x64": "2.1.0"
+  },
   "devDependencies": {
     "@types/node": "^25.9.1",
     "ink": "^7.1.0",

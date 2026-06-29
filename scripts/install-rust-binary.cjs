@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 const { copyFileSync, existsSync, mkdirSync, renameSync, rmSync, writeFileSync } = require("node:fs");
-const { join, resolve } = require("node:path");
+const { dirname, join, resolve } = require("node:path");
 const { spawnSync } = require("node:child_process");
 const { arch, platform } = require("node:process");
 
@@ -52,9 +52,22 @@ function installPackagedZellij() {
     return { installed: false, reason: "Windows uses the documented Windows Terminal fallback." };
   }
   const override = process.env.AGENT_RUN_CACHE_INSTALL_ZELLIJ;
-  const packaged = override
-    ? resolve(override)
-    : join(root, "prebuilds", platformKey(), "zellij");
+  let packaged;
+  let zellijSource;
+  if (override) {
+    packaged = resolve(override);
+    zellijSource = "env:AGENT_RUN_CACHE_INSTALL_ZELLIJ";
+  } else {
+    const depDir = optionalDepDir();
+    const depZellij = depDir ? join(depDir, "zellij") : null;
+    if (depZellij && existsSync(depZellij)) {
+      packaged = depZellij;
+      zellijSource = `optional-dep:arc-copilot-${platformKey()}`;
+    } else {
+      packaged = join(root, "prebuilds", platformKey(), "zellij");
+      zellijSource = `prebuild:${platformKey()}`;
+    }
+  }
 
   if (override && !isApplianceZellij(packaged)) {
     fail(
@@ -88,7 +101,7 @@ function installPackagedZellij() {
   return {
     installed: true,
     version: zellijMarker,
-    source: override ? "env:AGENT_RUN_CACHE_INSTALL_ZELLIJ" : `prebuild:${platformKey()}`,
+    source: zellijSource,
     binary: destination
   };
 }
@@ -123,6 +136,13 @@ function installSource() {
     return buildFromCargo();
   }
 
+  const depDir = optionalDepDir();
+  if (depDir) {
+    const depBin = [join(depDir, targetName), join(depDir, "arc"), join(depDir, "arc.exe")]
+      .find((path) => existsSync(path));
+    if (depBin) return { path: depBin, label: `optional-dep:arc-copilot-${platformKey()}` };
+  }
+
   const packagedDir = join(root, "prebuilds", platformKey());
   const packaged = [join(packagedDir, targetName), join(packagedDir, "arc"), join(packagedDir, "arc.exe")]
     .find((path) => existsSync(path));
@@ -146,6 +166,15 @@ function buildFromCargo() {
   const built = join(root, "target", "release", targetName);
   if (!existsSync(built)) fail(`cargo completed but did not produce ${built}`);
   return { path: built, label: "cargo:release" };
+}
+
+function optionalDepDir() {
+  const pkg = `arc-copilot-${platformKey()}`;
+  try {
+    return dirname(require.resolve(`${pkg}/package.json`, { paths: [root] }));
+  } catch {
+    return null;
+  }
 }
 
 function platformKey() {
