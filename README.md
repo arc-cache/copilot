@@ -15,7 +15,19 @@ The production Copilot integration is a Copilot plugin. The plugin declares ARC
 hooks and an ARC MCP server, both pointing back to the installed `arc` binary:
 
 ```bash
+# npm (any OS with Node 22+)
 npm i -g arc-copilot
+
+# or macOS / Linux, no prerequisites
+curl -fsSL https://raw.githubusercontent.com/arc-cache/copilot/main/install.sh | sh
+
+# or Windows (PowerShell)
+irm https://raw.githubusercontent.com/arc-cache/copilot/main/install.ps1 | iex
+```
+
+Then:
+
+```bash
 arc setup
 arc split
 ```
