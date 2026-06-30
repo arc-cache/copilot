@@ -66,3 +66,4 @@ test_cache_*/
 examples/live-sidecar-operational-session.jsonl
 ARC-app.zip
 ARC-app.zip.sha256
+/prebuilds/

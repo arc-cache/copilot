@@ -80,7 +80,7 @@ fn ensure_zellij() -> Result<PathBuf> {
     }
 
     Err(anyhow!(
-        "arc split requires bundled Zellij {ZELLIJ_APPLIANCE_VERSION}; run `npm rebuild agent-run-cache` or build it with `node scripts/build-zellij-appliance.cjs`"
+        "arc split requires bundled Zellij {ZELLIJ_APPLIANCE_VERSION}; run `npm rebuild arc-copilot` or build it with `node scripts/build-zellij-appliance.cjs`"
     ))
 }
 

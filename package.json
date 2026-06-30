@@ -12,8 +12,8 @@
   "homepage": "https://github.com/arc-cache/copilot#readme",
   "type": "module",
   "bin": {
-    "arc": "./bin/arc",
-    "agent-run-cache": "./bin/arc"
+    "arc": "bin/arc",
+    "agent-run-cache": "bin/arc"
   },
   "files": [
     "bin",
@@ -51,7 +51,10 @@
   "license": "Apache-2.0",
   "optionalDependencies": {
     "arc-copilot-darwin-arm64": "0.1.0",
-    "arc-copilot-darwin-x64": "0.1.0"
+    "arc-copilot-darwin-x64": "0.1.0",
+    "arc-copilot-linux-x64": "0.1.0",
+    "arc-copilot-linux-arm64": "0.1.0",
+    "arc-copilot-windows-x64": "0.1.0"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",

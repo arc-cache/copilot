@@ -50,3 +50,7 @@ arc doctor     plugin, runtime, and split-view readiness
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+---
+
+Built and maintained by [Ayub Mohyadin](https://ayubm.com).
