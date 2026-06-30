@@ -18,6 +18,16 @@ function main() {
   }
 
   mkdirSync(binDir, { recursive: true });
+
+  if (
+    process.argv.includes("--postinstall") &&
+    !process.env.AGENT_RUN_CACHE_INSTALL_BINARY &&
+    !locatePackagedBinary()
+  ) {
+    writeUnsupportedPlaceholder();
+    return;
+  }
+
   const source = installSource();
   copyExecutable(source.path, target);
   if (target !== portableTarget) copyExecutable(source.path, portableTarget);
@@ -36,7 +46,7 @@ function writePackagePlaceholder() {
   rmSync(join(binDir, "arc.exe"), { force: true });
   rmSync(join(binDir, "zellij"), { force: true });
   const body = `#!/usr/bin/env node
-console.error("ARC native binary is not installed. Run \`npm rebuild agent-run-cache\` or \`npm run build:rust\` to install it.");
+console.error("ARC native binary is not installed. Run \`npm rebuild arc-copilot\` or \`npm run build:rust\` to install it.");
 process.exit(1);
 `;
   writeFileSync(portableTarget, body);
@@ -44,6 +54,24 @@ process.exit(1);
     require("node:fs").chmodSync(portableTarget, 0o755);
   }
   console.log(`Prepared ARC package placeholder at ${portableTarget}.`);
+}
+
+function writeUnsupportedPlaceholder() {
+  rmSync(join(binDir, "arc-install.json"), { force: true });
+  rmSync(join(binDir, "arc.exe"), { force: true });
+  rmSync(join(binDir, "zellij"), { force: true });
+  const body = `#!/usr/bin/env node
+console.error("arc-copilot has no prebuilt binary for ${platformKey()} yet.");
+console.error("v0.1.0 ships macOS builds (darwin-arm64, darwin-x64); Linux and Windows are coming.");
+console.error("To build from source: install Rust and run 'npm run build:rust', or set AGENT_RUN_CACHE_INSTALL_BINARY to a prebuilt arc binary.");
+process.exit(1);
+`;
+  writeFileSync(portableTarget, body);
+  if (platform !== "win32") {
+    require("node:fs").chmodSync(portableTarget, 0o755);
+  }
+  console.log(`arc-copilot: no prebuilt binary for ${platformKey()} yet (macOS-only in v0.1.0).`);
+  console.log("Installed a placeholder; running 'arc' will explain how to build from source.");
 }
 
 function installPackagedZellij() {
@@ -136,22 +164,25 @@ function installSource() {
     return buildFromCargo();
   }
 
-  const depDir = optionalDepDir();
-  if (depDir) {
-    const depBin = [join(depDir, targetName), join(depDir, "arc"), join(depDir, "arc.exe")]
-      .find((path) => existsSync(path));
-    if (depBin) return { path: depBin, label: `optional-dep:arc-copilot-${platformKey()}` };
-  }
-
-  const packagedDir = join(root, "prebuilds", platformKey());
-  const packaged = [join(packagedDir, targetName), join(packagedDir, "arc"), join(packagedDir, "arc.exe")]
-    .find((path) => existsSync(path));
-  if (packaged) return { path: packaged, label: `prebuild:${platformKey()}` };
+  const packaged = locatePackagedBinary();
+  if (packaged) return packaged;
 
   if (!existsSync(cargoToml)) {
     fail("Cargo.toml is missing and no packaged ARC binary was found.");
   }
   return buildFromCargo();
+}
+
+function locatePackagedBinary() {
+  const candidates = (dir) => [join(dir, targetName), join(dir, "arc"), join(dir, "arc.exe")];
+  const depDir = optionalDepDir();
+  if (depDir) {
+    const depBin = candidates(depDir).find((path) => existsSync(path));
+    if (depBin) return { path: depBin, label: `optional-dep:arc-copilot-${platformKey()}` };
+  }
+  const prebuilt = candidates(join(root, "prebuilds", platformKey())).find((path) => existsSync(path));
+  if (prebuilt) return { path: prebuilt, label: `prebuild:${platformKey()}` };
+  return null;
 }
 
 function buildFromCargo() {

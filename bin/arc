@@ -1,3 +1,3 @@
 #!/usr/bin/env node
-console.error("ARC native binary is not installed. Run `npm rebuild agent-run-cache` or `npm run build:rust` to install it.");
+console.error("ARC native binary is not installed. Run `npm rebuild arc-copilot` or `npm run build:rust` to install it.");
 process.exit(1);

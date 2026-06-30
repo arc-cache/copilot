@@ -3,7 +3,7 @@
 > ARC watches a coding agent solve something in your repo, keeps the route that
 > actually worked, and hands it back before the next similar run.
 
-[![Latest release](https://img.shields.io/github/v/release/arc-cache/copilot?label=release)](https://github.com/arc-cache/copilot/releases/latest)
+[![npm](https://img.shields.io/npm/v/arc-copilot)](https://www.npmjs.com/package/arc-copilot)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](#license)
 
 ARC for Copilot is a local-first run cache and terminal companion for GitHub
@@ -15,22 +15,14 @@ The production Copilot integration is a Copilot plugin. The plugin declares ARC
 hooks and an ARC MCP server, both pointing back to the installed `arc` binary:
 
 ```bash
-# npm (any OS with Node 22+)
+# macOS (Node 22+)
 npm i -g arc-copilot
-
-# or macOS / Linux, no prerequisites
-curl -fsSL https://raw.githubusercontent.com/arc-cache/copilot/main/install.sh | sh
-
-# or Windows (PowerShell)
-irm https://raw.githubusercontent.com/arc-cache/copilot/main/install.ps1 | iex
-```
-
-Then:
-
-```bash
 arc setup
 arc split
 ```
+
+`arc-copilot` is macOS-only for now (Apple silicon and Intel). Linux and Windows
+builds, plus `curl … | sh` / PowerShell installers, are coming next.
 
 `arc split` opens Copilot and a narrow, live ARC companion pane in one terminal.
 It does not modify Copilot. Plain `copilot` and
