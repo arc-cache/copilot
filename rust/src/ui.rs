@@ -41,7 +41,7 @@ pub(crate) fn run_ui(args: &[String], workspace: &Path) -> Result<()> {
         println!("{}", render_ui_text(&model));
         return Ok(());
     }
-    if !io::stdout().is_terminal() {
+    if !io::stdout().is_terminal() && !split_appliance_mode() {
         println!("{}", render_status_summary(&model));
         return Ok(());
     }
