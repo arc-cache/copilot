@@ -47,6 +47,14 @@ arc capsules   list kept capsules
 arc doctor     plugin, runtime, and split-view readiness
 ```
 
+## Implementation
+
+The product is the native Rust binary in `rust/` — that is what the npm package
+installs and runs. `src/` is a TypeScript reference implementation kept for
+differential testing: `tests/rust_parity.rs` runs the Rust binary and the
+TypeScript side by side and asserts they produce identical behavior. The
+TypeScript is never shipped or executed at runtime.
+
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
