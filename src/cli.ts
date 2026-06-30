@@ -174,7 +174,7 @@ async function runSetup(args: string[], workspace: string): Promise<void> {
     copilotTabIgnored: ignoredTab,
     copilotTabCaveat: "The Copilot Arc tab patch is experimental. Run arc copilot-tab install explicitly if you want to try it.",
     capsuleCount: capsules.length,
-    launch: "copilot / ollama launch copilot --model gemma4:31b-cloud"
+    launch: "copilot"
   };
   if (hasJson(args)) {
     writeJson(payload);
@@ -185,7 +185,7 @@ async function runSetup(args: string[], workspace: string): Promise<void> {
   console.log(`plugin: ${plugin.pluginDir}`);
   if (plugin.reason) console.log(`plugin reason: ${plugin.reason}`);
   if (plugin.listOutput) console.log(plugin.listOutput);
-  console.log(`launch: copilot / ollama launch copilot --model gemma4:31b-cloud`);
+  console.log(`launch: copilot`);
   console.log(`view: arc ui`);
   console.log(`workspace activation: ${integration ?? "pending first plugin hook"}`);
   console.log(`runtime: ${currentArcRuntime().node} ${currentArcRuntime().entrypoint}`);
@@ -595,7 +595,7 @@ Usage:
 
 arc opens the terminal UI for the current repo. It shows seam status, capsules, live memory events, and a detail/action pane. If stdout is not a TTY, arc prints a short status summary and exits.
 
-arc plugin install is the normal Copilot setup. It installs ARC's packaged Copilot plugin with supported plugin hooks and the read-only ARC MCP server. After npm i -g agent-run-cache, run arc plugin install once, then launch Copilot normally with \`copilot\` or \`ollama launch copilot --model gemma4:31b-cloud\`. The plugin hooks inject recall through userPromptSubmitted, capture/review at sessionEnd, and auto-create the per-workspace ARC cache on first use. The plugin MCP server exposes arc_search, arc_status, and arc_capsule over stdio.
+arc plugin install is the normal Copilot setup. It installs ARC's packaged Copilot plugin with supported plugin hooks and the read-only ARC MCP server. After npm i -g arc-copilot, run arc plugin install once, then launch Copilot normally with \`copilot\`. The plugin hooks inject recall through userPromptSubmitted, capture/review at sessionEnd, and auto-create the per-workspace ARC cache on first use. The plugin MCP server exposes arc_search, arc_status, and arc_capsule over stdio.
 
 arc setup is kept as a compatibility alias for plugin install and optional config persistence. It no longer installs the SDK extension or patches Copilot. The legacy JSON-hook fallback and SDK extension experiment are explicit commands only.
 
