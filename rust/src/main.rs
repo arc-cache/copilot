@@ -42,8 +42,8 @@ use plugin::{
 };
 use retrieval::{build_injection_plan, ensure_embeddings_for_capsules, search_capsules_for_query};
 use review_capture::{
-    harvest_session, import_copilot_otel, import_copilot_transcript, review_events,
-    value_array_strings,
+    harvest_latest_session, harvest_session, import_copilot_otel, import_copilot_transcript,
+    review_events, value_array_strings,
 };
 use split::{cached_zellij, run_split};
 use store::{increment_capsule_use, load_capsules, save_capsule, update_capsule_metadata};

@@ -50,6 +50,26 @@ pub(crate) fn run_split(args: &[String], workspace: &Path) -> Result<()> {
             status.code().unwrap_or(-1)
         ));
     }
+    // Ctrl+q force-closes the split and kills Copilot before it can fire its
+    // SessionEnd hook, so harvest the session that just ran instead of relying
+    // on the hook that never arrives.
+    match harvest_latest_session(workspace) {
+        Ok(Some(session_id)) => {
+            let _ = debug(
+                workspace,
+                "split.harvested",
+                serde_json::json!({ "sessionId": session_id }),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = debug(
+                workspace,
+                "split.harvest_failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
+    }
     Ok(())
 }
 
