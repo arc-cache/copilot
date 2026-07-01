@@ -2,11 +2,11 @@ layout {
     tab name="ARC" focus=true {
         pane split_direction="vertical" {
             pane name="Copilot" size="70%" focus=true command="/bin/sh" {
-                args "-lc" "{{COPILOT_COMMAND}}"
+                args "-lc" "{{COPILOT_COMMAND}}; {{ZELLIJ_BIN}} action close-tab"
                 cwd "{{WORKSPACE}}"
             }
-            pane name="ARC" size="30%" command="/usr/bin/env" {
-                args "ARC_SPLIT_APPLIANCE=1" "{{ARC_BIN}}" "ui"
+            pane name="ARC" size="30%" command="/bin/sh" {
+                args "-lc" "ARC_SPLIT_APPLIANCE=1 {{ARC_BIN}} ui; {{ZELLIJ_BIN}} action close-tab"
                 cwd "{{WORKSPACE}}"
             }
         }

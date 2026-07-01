@@ -411,7 +411,7 @@ fn handle_narrow_key(
 ) -> Result<NarrowKeyOutcome> {
     use crossterm::event::KeyCode;
     match code {
-        KeyCode::Char('q') if !state.appliance => return Ok(NarrowKeyOutcome::Close),
+        KeyCode::Char('q') => return Ok(NarrowKeyOutcome::Close),
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
             if state.narrow_screen == NarrowScreen::Summary {
                 return Ok(if state.appliance {
@@ -844,7 +844,7 @@ fn draw_narrow_summary(
         lines.push(hairline(width));
         lines.push(Line::from(Span::styled(
             if state.appliance {
-                "Ctrl+q quit split"
+                "q close split · Ctrl+q also quits"
             } else {
                 "click a row · scroll to read"
             },
@@ -2641,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn split_appliance_cannot_close_or_zoom_the_arc_pane() {
+    fn split_appliance_closes_on_q_but_not_esc_or_zoom() {
         use crossterm::event::KeyCode;
 
         let model = test_model();
@@ -2649,7 +2649,13 @@ mod tests {
             appliance: true,
             ..InteractiveUiState::default()
         };
-        for key in [KeyCode::Char('q'), KeyCode::Esc, KeyCode::Char('f')] {
+        // q closes the ARC pane (which chains `zellij action close-tab` to close
+        // the whole split); Esc and f stay inert so they can't close by accident.
+        assert!(matches!(
+            handle_narrow_key(KeyCode::Char('q'), &model, &mut state).unwrap(),
+            NarrowKeyOutcome::Close
+        ));
+        for key in [KeyCode::Esc, KeyCode::Char('f')] {
             assert!(matches!(
                 handle_narrow_key(key, &model, &mut state).unwrap(),
                 NarrowKeyOutcome::Continue
@@ -2663,8 +2669,7 @@ mod tests {
             .draw(|frame| draw_ui_frame(frame, &model, &state, &mut hit_regions))
             .unwrap();
         let text = terminal_text(&terminal);
-        assert!(text.contains("Ctrl+q quit split"));
-        assert!(!text.contains("q/esc close"));
+        assert!(text.contains("q close split"));
         assert!(!hit_regions
             .iter()
             .any(|region| matches!(&region.action, UiAction::ToggleZoom)));
