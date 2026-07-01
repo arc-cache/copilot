@@ -112,6 +112,13 @@ pub(crate) fn embed_texts(texts: &[String], workspace: &Path) -> Result<Option<V
     match result {
         Ok(vectors) => Ok(Some(vectors)),
         Err(error) => {
+            set_embedding_state(
+                ManagedEmbeddingState::Error,
+                format!(
+                    "local embeddings unavailable: {}",
+                    truncate_error(&error.to_string())
+                ),
+            );
             debug(
                 workspace,
                 "local_embeddings.embed_failed",
@@ -120,6 +127,20 @@ pub(crate) fn embed_texts(texts: &[String], workspace: &Path) -> Result<Option<V
             Ok(None)
         }
     }
+}
+
+pub(crate) fn embedding_unavailable_reason() -> String {
+    let detail = embedding_runtime()
+        .lock()
+        .ok()
+        .map(|runtime| runtime.detail.trim().to_owned())
+        .filter(|detail| !detail.is_empty())
+        .unwrap_or_else(|| "no embedding runtime detail available".to_owned());
+    let detail = detail
+        .strip_prefix("local embeddings unavailable:")
+        .map(str::trim)
+        .unwrap_or(&detail);
+    format!("embeddings unavailable: {detail}")
 }
 
 fn ensure_local_embeddings(workspace: &Path) -> Result<Option<String>> {

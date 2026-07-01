@@ -4,7 +4,8 @@ import { readFile, stat } from "node:fs/promises";
 import { isAbsolute, resolve } from "node:path";
 
 import { loadArcConfig } from "./config.js";
-import { LOCAL_EMBEDDING_MODEL_NAME, embedTexts } from "./local-embeddings.js";
+import { LOCAL_EMBEDDING_MODEL_NAME, embedTexts, embeddingUnavailableReason } from "./local-embeddings.js";
+import { judgeReachability } from "./judge-reachability.js";
 import { loadRetrievalReputation, recordJudgeDecision } from "./retrieval-reputation.js";
 import { debug, incrementCapsuleUse, loadCapsules, updateCapsuleDerivedData } from "./store.js";
 import { consultCapsuleVault } from "./sidecar.js";
@@ -108,30 +109,62 @@ export async function buildInjectionPlan(prompt: string, workspace: string, cont
   let sidecarFailure: string | undefined;
   let judgeDecisionId: string | undefined;
   if (shouldJudge) {
-    try {
-      sidecar = await consultCapsuleVault(matchText, shortlist, workspace, {
-        runner: context.runner,
-        judgeModel: judgeMode === "provider-judge" ? config.injectionJudgeModel : undefined
+    const reachability = judgeReachability(config);
+    if (providerJudgeConfigured && !reachability.reachable) {
+      sidecarFailure = reachability.reason;
+      const decision = await recordJudgeDecision({
+        workspace,
+        sessionId: context.sessionId,
+        prompt: matchText,
+        mode: "provider-judge",
+        model: config.injectionJudgeModel,
+        candidates: rankedCandidates(ranked, shortlist),
+        verdict: { abstain: true, confidence: ranked.topScore, reason: sidecarFailure },
+        outcome: { injected: false, used: "unknown", helped: "unknown" }
       });
-      if (judgeMode === "provider-judge") {
-        const accepted = Boolean(sidecar?.applies && sidecar.capsuleId && (explicitConsult || judgeConfidence(sidecar) >= providerJudgeConfidenceThreshold()));
-        const decision = await recordJudgeDecision({
-          workspace,
-          sessionId: context.sessionId,
-          prompt: matchText,
-          mode: "provider-judge",
-          model: config.injectionJudgeModel,
-          candidates: rankedCandidates(ranked, shortlist),
-          verdict: accepted && sidecar?.capsuleId
-            ? { inject: sidecar.capsuleId, confidence: sidecar.confidence ?? 0.5, reason: sidecar.reason }
-            : { abstain: true, confidence: sidecar?.confidence ?? 0.5, reason: sidecar?.reason ?? "judge abstained" },
-          outcome: { injected: accepted, used: "unknown", helped: "unknown" }
+      judgeDecisionId = decision.id;
+      await debug("retrieval.sidecar_failed", { error: "judge reachability check failed", reason: sidecarFailure }, workspace);
+    } else {
+      try {
+        sidecar = await consultCapsuleVault(matchText, shortlist, workspace, {
+          runner: context.runner,
+          judgeModel: judgeMode === "provider-judge" ? config.injectionJudgeModel : undefined
         });
-        judgeDecisionId = decision.id;
+        if (judgeMode === "provider-judge") {
+          const accepted = Boolean(sidecar?.applies && sidecar.capsuleId && (explicitConsult || judgeConfidence(sidecar) >= providerJudgeConfidenceThreshold()));
+          const decision = await recordJudgeDecision({
+            workspace,
+            sessionId: context.sessionId,
+            prompt: matchText,
+            mode: "provider-judge",
+            model: config.injectionJudgeModel,
+            candidates: rankedCandidates(ranked, shortlist),
+            verdict: accepted && sidecar?.capsuleId
+              ? { inject: sidecar.capsuleId, confidence: sidecar.confidence ?? 0.5, reason: sidecar.reason }
+              : { abstain: true, confidence: sidecar?.confidence ?? 0.5, reason: sidecar?.reason ?? "judge abstained" },
+            outcome: { injected: accepted, used: "unknown", helped: "unknown" }
+          });
+          judgeDecisionId = decision.id;
+        }
+      } catch (error) {
+        sidecarFailure = providerJudgeConfigured
+          ? `judge configured but unreachable: ${String(error).slice(0, 400)}`
+          : summarizeSidecarFailure(error);
+        if (providerJudgeConfigured) {
+          const decision = await recordJudgeDecision({
+            workspace,
+            sessionId: context.sessionId,
+            prompt: matchText,
+            mode: "provider-judge",
+            model: config.injectionJudgeModel,
+            candidates: rankedCandidates(ranked, shortlist),
+            verdict: { abstain: true, confidence: ranked.topScore, reason: sidecarFailure },
+            outcome: { injected: false, used: "unknown", helped: "unknown" }
+          });
+          judgeDecisionId = decision.id;
+        }
+        await debug("retrieval.sidecar_failed", { error: String(error), reason: sidecarFailure }, workspace);
       }
-    } catch (error) {
-      sidecarFailure = summarizeSidecarFailure(error);
-      await debug("retrieval.sidecar_failed", { error: String(error), reason: sidecarFailure }, workspace);
     }
   } else if (providerJudgeConfigured && ranked.available) {
     const decision = await recordJudgeDecision({
@@ -189,7 +222,7 @@ export async function buildInjectionPlan(prompt: string, workspace: string, cont
     return {
       shouldInject: false,
       message: "",
-      reason: sidecar?.reason ?? sidecarFailure ?? "no matching capsule",
+      reason: sidecar?.reason ?? sidecarFailure ?? (ranked.available ? "no matching capsule" : ranked.reason),
       source: "local",
       judgeDecisionId,
       actionRisk: actionRisk || undefined
@@ -329,7 +362,7 @@ async function rankCapsules(prompt: string, capsules: Capsule[], workspace: stri
   if (!reusable.length) return { available: false, shortlist: [], best: null, scores: [], reason: "no retrievable capsules" };
   const promptVectors = await embedTexts([prompt], workspace);
   const promptVector = promptVectors?.[0];
-  if (!promptVector?.length) return { available: false, shortlist: [], best: null, scores: [], reason: "embeddings unavailable" };
+  if (!promptVector?.length) return { available: false, shortlist: [], best: null, scores: [], reason: embeddingUnavailableReason() };
 
   const embedded = await ensureEmbeddingsForCapsules(reusable, workspace);
   const reputation = await loadRetrievalReputation(workspace);

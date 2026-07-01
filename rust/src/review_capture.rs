@@ -2524,7 +2524,7 @@ fn record_review(workspace: &Path, record: ReviewRecord) -> Result<()> {
     append_jsonl(&reviewed_path(workspace), &record)
 }
 
-fn record_sidecar_exchange(
+pub(crate) fn record_sidecar_exchange(
     workspace: &Path,
     kind: &str,
     source: &str,
@@ -2603,6 +2603,56 @@ fn run_model_sidecar(prompt: &str, workspace: &Path, runner: &str) -> Result<Str
         "copilot" => run_copilot_sidecar(prompt, workspace, None),
         other => Err(anyhow!("unsupported model sidecar runner: {other}")),
     }
+}
+
+pub(crate) fn run_judge_sidecar(
+    prompt: &str,
+    workspace: &Path,
+    model: &JudgeModel,
+) -> Result<String> {
+    match model.provider.as_str() {
+        "ollama" => run_ollama_judge(prompt, &model.id),
+        "copilot" => run_copilot_sidecar(prompt, workspace, Some(&model.id)),
+        provider => Err(anyhow!("unsupported judge provider: {provider}")),
+    }
+}
+
+fn run_ollama_judge(prompt: &str, model: &str) -> Result<String> {
+    let base = env::var("OLLAMA_HOST")
+        .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned())
+        .trim_end_matches('/')
+        .to_owned();
+    let response = ureq::post(&format!("{base}/api/chat"))
+        .timeout(Duration::from_millis(sidecar_timeout_ms()))
+        .set("content-type", "application/json")
+        .send_json(json!({
+            "model": model,
+            "stream": false,
+            "format": "json",
+            "options": { "temperature": 0 },
+            "messages": [{ "role": "user", "content": prompt }]
+        }))
+        .context("Ollama judge request failed")?;
+    let payload = response
+        .into_json::<Value>()
+        .context("Ollama judge returned invalid JSON")?;
+    payload
+        .get("message")
+        .and_then(|message| message.get("content"))
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("response").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|output| !output.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("Ollama judge returned an empty response"))
+}
+
+fn sidecar_timeout_ms() -> u64 {
+    env::var("AGENT_RUN_CACHE_SIDECAR_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120_000)
 }
 
 fn run_copilot_sidecar(prompt: &str, workspace: &Path, model: Option<&str>) -> Result<String> {

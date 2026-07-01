@@ -7,6 +7,7 @@ import { readActivationIntegration } from "./install.js";
 import { loadMemoryEvents } from "./ledger.js";
 import { cacheDir, workspaceRoot } from "./paths.js";
 import { buildInjectionPlan } from "./retrieval.js";
+import { judgeReachability } from "./judge-reachability.js";
 import { loadCapsules, updateCapsuleMetadata } from "./store.js";
 import type { MemoryEvent } from "./ledger.js";
 import type { ArcUiAction, ArcUiCapsuleRow, ArcUiEventRow, ArcUiViewModel } from "./ui-model.js";
@@ -45,7 +46,8 @@ export async function loadArcUiViewModel(workspace = workspaceRoot(), options: L
       eventCount: events.length,
       judge: {
         mode: config.injectionJudgeMode ?? "embedding-only",
-        model: config.injectionJudgeModel ?? null
+        model: config.injectionJudgeModel ?? null,
+        reachability: judgeReachability(config)
       },
       integration,
       extension,

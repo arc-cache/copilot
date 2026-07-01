@@ -27,11 +27,11 @@ mod split;
 mod store;
 mod ui;
 
-use embedder::{embed_texts, stop_local_embeddings};
+use embedder::{embed_texts, embedding_unavailable_reason, stop_local_embeddings};
 use judge::{
-    list_judge_models, load_arc_config, load_retrieval_reputation, parse_judge_model,
-    provider_judge_confidence_threshold, provider_judge_high_threshold, reconcile_judge_outcome,
-    record_judge_decision, run_judge, save_arc_config,
+    judge_reachability, list_judge_models, load_arc_config, load_retrieval_reputation,
+    parse_judge_model, provider_judge_confidence_threshold, provider_judge_high_threshold,
+    reconcile_judge_outcome, record_judge_decision, run_judge, save_arc_config, JudgeReachability,
 };
 use mcp::run_mcp;
 use plugin::{
@@ -43,7 +43,7 @@ use plugin::{
 use retrieval::{build_injection_plan, ensure_embeddings_for_capsules, search_capsules_for_query};
 use review_capture::{
     harvest_latest_session, harvest_session, import_copilot_otel, import_copilot_transcript,
-    review_events, value_array_strings,
+    record_sidecar_exchange, review_events, run_judge_sidecar, value_array_strings,
 };
 use split::{cached_zellij, run_split};
 use store::{increment_capsule_use, load_capsules, save_capsule, update_capsule_metadata};
@@ -100,6 +100,20 @@ fn run_status(args: &[String], workspace: &Path) -> Result<()> {
             })
             .unwrap_or_else(|| "none".to_owned());
         println!("judge: {judge_mode} ({judge_model})");
+        println!(
+            "judge reachable: {} ({})",
+            if payload["judge"]["reachability"]["reachable"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                "yes"
+            } else {
+                "no"
+            },
+            payload["judge"]["reachability"]["reason"]
+                .as_str()
+                .unwrap_or("unknown")
+        );
         if let Some(label) = payload["injectionPause"]["label"].as_str() {
             if payload["injectionPause"]["paused"]
                 .as_bool()
@@ -429,6 +443,7 @@ fn run_doctor(args: &[String], workspace: &Path) -> Result<()> {
     let capsules = load_capsules(workspace)?;
     let events = load_memory_events(workspace)?;
     let config = load_arc_config()?;
+    let judge_reachability = judge_reachability(&config);
     let injection_pause = injection_pause_status(&config);
     let zellij = cached_zellij();
     let split_engine = if cfg!(windows) {
@@ -443,14 +458,15 @@ fn run_doctor(args: &[String], workspace: &Path) -> Result<()> {
         "extension": extension_status(workspace),
         "hook": hook_status(workspace),
         "integration": read_activation_integration(workspace),
-        "sidecarCopilotCommand": config.sidecar_copilot_command,
+        "sidecarCopilotCommand": config.sidecar_copilot_command.clone(),
         "capsuleCount": capsules.len(),
         "eventCount": events.len(),
         "lastInjection": last_event(&events, "capsule.injected"),
         "lastSave": last_save_event(&events),
         "judge": {
-            "mode": config.injection_judge_mode.unwrap_or_else(|| "embedding-only".to_owned()),
-            "model": config.injection_judge_model
+            "mode": config.injection_judge_mode.clone().unwrap_or_else(|| "embedding-only".to_owned()),
+            "model": config.injection_judge_model.clone(),
+            "reachability": judge_reachability
         },
         "injectionPause": injection_pause,
         "split": {
@@ -467,6 +483,20 @@ fn run_doctor(args: &[String], workspace: &Path) -> Result<()> {
         println!("workspace: {}", workspace.display());
         println!("capsules: {}", capsules.len());
         println!("events: {}", events.len());
+        println!(
+            "judge reachable: {} ({})",
+            if payload["judge"]["reachability"]["reachable"]
+                .as_bool()
+                .unwrap_or(false)
+            {
+                "yes"
+            } else {
+                "no"
+            },
+            payload["judge"]["reachability"]["reason"]
+                .as_str()
+                .unwrap_or("unknown")
+        );
         println!(
             "extension: {}",
             if payload["extension"]["installed"].as_bool().unwrap_or(false) {
@@ -1863,43 +1893,60 @@ fn consult_capsule_vault(
     workspace: &Path,
     judge_model: Option<JudgeModel>,
 ) -> Result<SidecarConsult> {
-    let command = env::var("AGENT_RUN_CACHE_CONSULT_COMMAND")
-        .or_else(|_| env::var("AGENT_RUN_CACHE_MODEL_SIDECAR"))
-        .unwrap_or_default();
-    let command = command.trim();
-    if command.is_empty() || command == "off" {
-        return Err(anyhow!("consult sidecar not configured"));
-    }
-    let payload = json!({
-        "task": "consult",
-        "workspace": workspace,
-        "prompt": prompt,
-        "capsules": shortlist,
-        "judgeModel": judge_model
-    });
-    let mut child = if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/C", command]);
-        c
+    let (source, input, output) = if let Some(command) = configured_consult_command() {
+        let payload = json!({
+            "task": "consult",
+            "workspace": workspace,
+            "prompt": prompt,
+            "capsules": shortlist,
+            "judgeModel": judge_model.as_ref()
+        });
+        let input = serde_json::to_string(&payload)?;
+        let mut child = if cfg!(windows) {
+            let mut child = Command::new("cmd");
+            child.args(["/C", &command]);
+            child
+        } else {
+            let mut child = Command::new("sh");
+            child.args(["-lc", &command]);
+            child
+        };
+        let mut child = child
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            stdin.write_all(input.as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(anyhow!("{}", String::from_utf8_lossy(&output.stderr)));
+        }
+        (
+            "command".to_owned(),
+            input,
+            String::from_utf8_lossy(&output.stdout).to_string(),
+        )
     } else {
-        let mut c = Command::new("sh");
-        c.args(["-lc", command]);
-        c
+        let model = judge_model
+            .as_ref()
+            .ok_or_else(|| anyhow!("consult sidecar not configured"))?;
+        let input = consult_prompt(prompt, shortlist)?;
+        let output = run_judge_sidecar(&input, workspace, model)?;
+        (model.provider.clone(), input, output)
     };
-    let mut child = child
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(serde_json::to_string(&payload)?.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        return Err(anyhow!("{}", String::from_utf8_lossy(&output.stderr)));
-    }
-    let text = String::from_utf8_lossy(&output.stdout);
-    let value = extract_json_object(&text)?;
+    let value = extract_json_object(&output)?;
+    record_sidecar_exchange(workspace, "consult", &source, &input, &output, &value)?;
+    debug(
+        workspace,
+        &format!("sidecar.consult.{source}"),
+        json!({
+            "bytes": output.len(),
+            "candidateCount": shortlist.len(),
+            "model": judge_model.as_ref().map(|model| model.id.clone())
+        }),
+    )?;
     Ok(SidecarConsult {
         applies: value["applies"].as_bool().unwrap_or(false),
         capsule_id: value["capsuleId"].as_str().map(str::to_owned),
@@ -1907,6 +1954,54 @@ fn consult_capsule_vault(
         reason: value["reason"].as_str().map(str::to_owned),
         note: value["note"].as_str().map(str::to_owned),
     })
+}
+
+fn configured_consult_command() -> Option<String> {
+    if let Ok(command) = env::var("AGENT_RUN_CACHE_CONSULT_COMMAND") {
+        let command = command.trim();
+        if !command.is_empty() && command != "off" {
+            return Some(command.to_owned());
+        }
+    }
+    let command = env::var("AGENT_RUN_CACHE_MODEL_SIDECAR").ok()?;
+    let command = command.trim();
+    if command.is_empty() || matches!(command, "auto" | "off" | "opencode" | "copilot") {
+        None
+    } else {
+        Some(command.to_owned())
+    }
+}
+
+fn consult_prompt(prompt: &str, shortlist: &[Capsule]) -> Result<String> {
+    let capsules = truncate(&serde_json::to_string(shortlist)?, 60_000);
+    Ok(format!(
+        r#"You are the Agent Run Cache consulting sidecar.
+
+The main agent is about to handle a user prompt in this repository. Decide whether any saved workflow capsule from this repo is close enough to help.
+
+Return JSON only:
+{{
+  "applies": true,
+  "capsuleId": "id from the vault",
+  "confidence": 0.0,
+  "reason": "why this applies",
+  "note": "compact note to give the main agent"
+}}
+
+If nothing clearly applies, return {{"applies": false, "confidence": 0.0, "reason": "..."}}.
+
+Rules:
+- Decide semantic similarity rather than requiring exact words.
+- Prefer one strong capsule over many weak ones.
+- Return applies:false when the user explicitly forbids the capsule's action.
+- Stay silent when the prompt is unrelated.
+
+User prompt:
+{prompt}
+
+Capsule vault:
+{capsules}"#
+    ))
 }
 
 fn extract_json_object(text: &str) -> Result<Value> {
@@ -2118,6 +2213,7 @@ fn status_payload(workspace: &Path) -> Result<Value> {
     let capsules = load_capsules(workspace)?;
     let events = load_memory_events(workspace)?;
     let config = load_arc_config()?;
+    let judge_reachability = judge_reachability(&config);
     let injection_pause = injection_pause_status(&config);
     Ok(json!({
         "workspace": workspace,
@@ -2129,8 +2225,9 @@ fn status_payload(workspace: &Path) -> Result<Value> {
         "extension": extension_status(workspace),
         "hook": hook_status(workspace),
         "judge": {
-            "mode": config.injection_judge_mode.unwrap_or_else(|| "embedding-only".to_owned()),
-            "model": config.injection_judge_model
+            "mode": config.injection_judge_mode.clone().unwrap_or_else(|| "embedding-only".to_owned()),
+            "model": config.injection_judge_model.clone(),
+            "reachability": judge_reachability
         },
         "injectionPause": injection_pause,
         "capsuleCount": capsules.len(),

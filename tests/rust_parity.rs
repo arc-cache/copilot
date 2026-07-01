@@ -7,8 +7,9 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::OnceLock;
+use std::sync::{mpsc, OnceLock};
 use std::thread;
+use std::time::Duration;
 
 static TS_BUILD: OnceLock<()> = OnceLock::new();
 
@@ -277,6 +278,160 @@ process.stdin.on("end", () => {
         None,
     );
     assert_eq!(capsule["capsule"]["confidence"], 0.9);
+}
+
+#[test]
+fn rust_provider_judge_uses_the_built_in_ollama_path() {
+    ensure_ts_build();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    seed_capsule_with_ts(&workspace);
+    let embeddings = start_sequenced_embedding_endpoint([1.0, 0.0], [0.66, 0.751_265]);
+    let (ollama, request) = start_ollama_judge_endpoint();
+    let env = [
+        ("AGENT_RUN_CACHE_EMBEDDING_ENDPOINT", embeddings.as_str()),
+        ("OLLAMA_HOST", ollama.as_str()),
+    ];
+
+    let set = run_rust_json_with_env(
+        &[
+            "judge",
+            "set",
+            "--json",
+            "--mode",
+            "provider-judge",
+            "--model",
+            "ollama:test-judge",
+        ],
+        &workspace,
+        None,
+        &env,
+    );
+    assert_eq!(set["reachability"]["reachable"], true);
+    assert_eq!(set["reachability"]["path"], "built-in-ollama-api");
+
+    let plan = run_rust_json_with_env(
+        &["probe", "checking", "CLI", "JSON", "output", "--json"],
+        &workspace,
+        None,
+        &env,
+    );
+    assert_eq!(plan["shouldInject"], false);
+    assert_eq!(plan["source"], "sidecar");
+    assert_eq!(plan["reason"], "built-in Ollama judge abstained");
+
+    let request = request.recv_timeout(Duration::from_secs(2)).unwrap();
+    assert_eq!(request["model"], "test-judge");
+    assert!(request["messages"][0]["content"]
+        .as_str()
+        .unwrap()
+        .contains("Agent Run Cache consulting sidecar"));
+    let decisions = run_rust_json(&["judge", "decisions", "--json"], &workspace, None);
+    assert_eq!(decisions["total"], 1);
+    assert_eq!(
+        decisions["decisions"][0]["verdict"]["reason"],
+        "built-in Ollama judge abstained"
+    );
+    let sidecar =
+        fs::read_to_string(workspace.join(".agent-run-cache/debug/sidecar.jsonl")).unwrap();
+    assert!(sidecar.contains("\"kind\":\"consult\""));
+    assert!(sidecar.contains("\"source\":\"ollama\""));
+}
+
+#[test]
+fn rust_provider_judge_unreachable_reason_is_explicit_on_every_status_surface() {
+    ensure_ts_build();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    seed_capsule_with_ts(&workspace);
+    let embeddings = start_sequenced_embedding_endpoint([1.0, 0.0], [0.66, 0.751_265]);
+    let missing = workspace.join("missing-copilot");
+    let env = [
+        ("AGENT_RUN_CACHE_EMBEDDING_ENDPOINT", embeddings.as_str()),
+        ("AGENT_RUN_CACHE_COPILOT_BIN", missing.to_str().unwrap()),
+        ("AGENT_RUN_CACHE_CONSULT_COMMAND", ""),
+        ("AGENT_RUN_CACHE_SIDECAR_COPILOT_COMMAND", ""),
+        ("AGENT_RUN_CACHE_COPILOT_COMMAND", ""),
+    ];
+
+    let set = run_rust_json_with_env(
+        &[
+            "judge",
+            "set",
+            "--json",
+            "--mode",
+            "provider-judge",
+            "--model",
+            "copilot:test-judge",
+        ],
+        &workspace,
+        None,
+        &env,
+    );
+    let expected = "judge configured but unreachable: Copilot sidecar command not found";
+    assert_eq!(set["reachability"]["reachable"], false);
+    assert_eq!(set["reachability"]["reason"], expected);
+    assert_eq!(set["warning"], expected);
+
+    let plan = run_rust_json_with_env(
+        &["probe", "checking", "CLI", "JSON", "output", "--json"],
+        &workspace,
+        None,
+        &env,
+    );
+    assert_eq!(plan["shouldInject"], true);
+    assert_eq!(plan["source"], "local");
+    let decisions =
+        run_rust_json_with_env(&["judge", "decisions", "--json"], &workspace, None, &env);
+    assert_eq!(decisions["total"], 1);
+    assert_eq!(decisions["decisions"][0]["verdict"]["reason"], expected);
+
+    let status = run_rust_json_with_env(&["judge", "status", "--json"], &workspace, None, &env);
+    assert_eq!(status["reachability"]["reason"], expected);
+    let doctor = run_rust_json_with_env(&["doctor", "--json"], &workspace, None, &env);
+    assert_eq!(doctor["judge"]["reachability"]["reason"], expected);
+    let ui = run_rust_json_with_env(&["tab", "--json"], &workspace, None, &env);
+    assert_eq!(ui["status"]["judge"]["reachability"]["reason"], expected);
+    let ui_text = run_rust_raw(&["ui", "--once"], &workspace, None, &env);
+    assert!(ui_text.contains("judge provider:copilot:test-judge:unreachable"));
+
+    let debug = fs::read_to_string(workspace.join(".agent-run-cache/debug/runtime.jsonl")).unwrap();
+    assert!(debug.contains("retrieval.sidecar_failed"));
+    assert!(debug.contains(expected));
+    assert!(!debug.contains("sidecar unavailable; using local matching only"));
+}
+
+#[test]
+fn rust_probe_distinguishes_embedding_unavailable_from_below_threshold() {
+    ensure_ts_build();
+    let unavailable_workspace = tempfile::tempdir().unwrap();
+    let unavailable_workspace = unavailable_workspace.path().canonicalize().unwrap();
+    seed_capsule_with_ts(&unavailable_workspace);
+    let unavailable = run_rust_json(
+        &["probe", "unrelated", "quantum", "bananas", "--json"],
+        &unavailable_workspace,
+        None,
+    );
+    assert_eq!(unavailable["shouldInject"], false);
+    let unavailable_reason = unavailable["reason"].as_str().unwrap();
+    assert!(unavailable_reason.starts_with("embeddings unavailable:"));
+    assert!(!unavailable_reason.contains("below 0.58"));
+
+    let below_workspace = tempfile::tempdir().unwrap();
+    let below_workspace = below_workspace.path().canonicalize().unwrap();
+    seed_capsule_with_ts(&below_workspace);
+    let embeddings = start_sequenced_embedding_endpoint([1.0, 0.0], [0.0, 1.0]);
+    let below = run_rust_json_with_env(
+        &["probe", "unrelated", "quantum", "bananas", "--json"],
+        &below_workspace,
+        None,
+        &[("AGENT_RUN_CACHE_EMBEDDING_ENDPOINT", embeddings.as_str())],
+    );
+    assert_eq!(below["shouldInject"], false);
+    assert_eq!(
+        below["reason"],
+        "embedding distance gate abstained below 0.58"
+    );
 }
 
 #[test]
@@ -2205,6 +2360,88 @@ fn start_embedding_endpoint() -> String {
         }
     });
     format!("http://{address}/v1")
+}
+
+fn start_sequenced_embedding_endpoint(prompt_vector: [f64; 2], capsule_vector: [f64; 2]) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    thread::spawn(move || {
+        let mut request_index = 0usize;
+        for stream in listener.incoming().take(4) {
+            let mut stream = stream.unwrap();
+            let request = read_http_request(&mut stream);
+            let count = String::from_utf8_lossy(&request)
+                .split("\r\n\r\n")
+                .nth(1)
+                .and_then(|body| serde_json::from_str::<Value>(body).ok())
+                .and_then(|value| value["input"].as_array().map(Vec::len))
+                .unwrap_or(1);
+            let vector = if request_index == 0 {
+                prompt_vector
+            } else {
+                capsule_vector
+            };
+            request_index += 1;
+            let body = serde_json::json!({
+                "data": (0..count)
+                    .map(|_| serde_json::json!({ "embedding": vector }))
+                    .collect::<Vec<_>>()
+            })
+            .to_string();
+            write_http_json(&mut stream, &body);
+        }
+    });
+    format!("http://{address}/v1")
+}
+
+fn start_ollama_judge_endpoint() -> (String, mpsc::Receiver<Value>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (sender, receiver) = mpsc::channel();
+    thread::spawn(move || {
+        let mut stream = listener.incoming().next().unwrap().unwrap();
+        let request = read_http_request(&mut stream);
+        let request = String::from_utf8_lossy(&request)
+            .split("\r\n\r\n")
+            .nth(1)
+            .and_then(|body| serde_json::from_str::<Value>(body).ok())
+            .unwrap();
+        sender.send(request).unwrap();
+        let content = serde_json::json!({
+            "applies": false,
+            "confidence": 0.91,
+            "reason": "built-in Ollama judge abstained"
+        })
+        .to_string();
+        let body = serde_json::json!({ "message": { "content": content } }).to_string();
+        write_http_json(&mut stream, &body);
+    });
+    (format!("http://{address}"), receiver)
+}
+
+fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    let mut temp = [0_u8; 4096];
+    loop {
+        let read = stream.read(&mut temp).unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        buffer.extend_from_slice(&temp[..read]);
+        if request_complete(&buffer) {
+            break;
+        }
+    }
+    buffer
+}
+
+fn write_http_json(stream: &mut std::net::TcpStream, body: &str) {
+    let response = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+        body.len(),
+        body
+    );
+    stream.write_all(response.as_bytes()).unwrap();
 }
 
 fn request_complete(buffer: &[u8]) -> bool {

@@ -2,6 +2,7 @@ import type { CopilotHookStatus } from "./hook-status.js";
 import type { CopilotSdkExtensionStatus } from "./copilot-extension.js";
 import type { ArcIntegration } from "./install.js";
 import type { CapsuleStatus, PrivacyLabel } from "./types.js";
+import type { JudgeReachability } from "./judge-reachability.js";
 
 export interface ArcUiStatus {
   repo: string;
@@ -24,6 +25,7 @@ export interface ArcUiJudgeStatus {
     provider: "copilot" | "ollama";
     id: string;
   } | null;
+  reachability: JudgeReachability;
 }
 
 export interface ArcUiCapsuleRow {

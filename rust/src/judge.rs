@@ -81,19 +81,33 @@ pub(crate) fn run_judge(args: &[String], workspace: &Path) -> Result<()> {
                 }
             }
             let config = save_arc_config(patch)?;
+            let reachability = judge_reachability(&config);
+            let warning = judge_warning(&reachability);
             if json_mode {
-                write_json(&json!({ "configPath": arc_config_path(), "config": config }))
+                write_json(&json!({
+                    "configPath": arc_config_path(),
+                    "config": config,
+                    "reachability": reachability,
+                    "warning": warning
+                }))
             } else {
-                print_judge_config(&config);
+                print_judge_config(&config, &reachability);
                 Ok(())
             }
         }
         "status" => {
             let config = load_arc_config()?;
+            let reachability = judge_reachability(&config);
+            let warning = judge_warning(&reachability);
             if json_mode {
-                write_json(&json!({ "configPath": arc_config_path(), "config": config }))
+                write_json(&json!({
+                    "configPath": arc_config_path(),
+                    "config": config,
+                    "reachability": reachability,
+                    "warning": warning
+                }))
             } else {
-                print_judge_config(&config);
+                print_judge_config(&config, &reachability);
                 Ok(())
             }
         }
@@ -190,7 +204,127 @@ pub(crate) fn parse_judge_model(value: &str) -> Result<JudgeModel> {
     })
 }
 
-fn print_judge_config(config: &ArcConfig) {
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct JudgeReachability {
+    pub(crate) configured: bool,
+    pub(crate) reachable: bool,
+    pub(crate) path: Option<String>,
+    pub(crate) check: String,
+    pub(crate) reason: String,
+}
+
+pub(crate) fn judge_reachability(config: &ArcConfig) -> JudgeReachability {
+    let mode = config
+        .injection_judge_mode
+        .as_deref()
+        .unwrap_or("embedding-only");
+    if mode != "provider-judge" {
+        return JudgeReachability {
+            configured: false,
+            reachable: false,
+            path: None,
+            check: "static".to_owned(),
+            reason: "provider judge disabled".to_owned(),
+        };
+    }
+    let Some(model) = config.injection_judge_model.as_ref() else {
+        return unreachable_judge("no judge model configured");
+    };
+    if let Ok(command) = env::var("AGENT_RUN_CACHE_CONSULT_COMMAND") {
+        let command = command.trim();
+        if command == "off" {
+            return unreachable_judge("AGENT_RUN_CACHE_CONSULT_COMMAND=off");
+        }
+        if !command.is_empty() {
+            return JudgeReachability {
+                configured: true,
+                reachable: true,
+                path: Some("custom-consult-command".to_owned()),
+                check: "static".to_owned(),
+                reason: "custom consult command configured; live invocation not probed".to_owned(),
+            };
+        }
+    }
+    if let Ok(command) = env::var("AGENT_RUN_CACHE_MODEL_SIDECAR") {
+        let command = command.trim();
+        if !command.is_empty() && !matches!(command, "auto" | "off" | "opencode" | "copilot") {
+            return JudgeReachability {
+                configured: true,
+                reachable: true,
+                path: Some("legacy-model-sidecar-command".to_owned()),
+                check: "static".to_owned(),
+                reason: "legacy model sidecar command configured; live invocation not probed"
+                    .to_owned(),
+            };
+        }
+    }
+    match model.provider.as_str() {
+        "ollama" => JudgeReachability {
+            configured: true,
+            reachable: true,
+            path: Some("built-in-ollama-api".to_owned()),
+            check: "static".to_owned(),
+            reason: "built-in Ollama judge path available; live model not probed".to_owned(),
+        },
+        "copilot" if copilot_judge_command_available(config) => JudgeReachability {
+            configured: true,
+            reachable: true,
+            path: Some("built-in-copilot-sidecar".to_owned()),
+            check: "static".to_owned(),
+            reason: "built-in Copilot judge path available; live model not probed".to_owned(),
+        },
+        "copilot" => unreachable_judge("Copilot sidecar command not found"),
+        provider => unreachable_judge(&format!("unsupported judge provider: {provider}")),
+    }
+}
+
+fn unreachable_judge(detail: &str) -> JudgeReachability {
+    JudgeReachability {
+        configured: true,
+        reachable: false,
+        path: None,
+        check: "static".to_owned(),
+        reason: format!("judge configured but unreachable: {detail}"),
+    }
+}
+
+fn copilot_judge_command_available(config: &ArcConfig) -> bool {
+    for value in [
+        env::var("AGENT_RUN_CACHE_SIDECAR_COPILOT_COMMAND").ok(),
+        config.sidecar_copilot_command.clone(),
+        env::var("AGENT_RUN_CACHE_COPILOT_COMMAND").ok(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !value.trim().is_empty() {
+            return true;
+        }
+    }
+    let executable =
+        env::var("AGENT_RUN_CACHE_COPILOT_BIN").unwrap_or_else(|_| "copilot".to_owned());
+    executable_available(&executable)
+}
+
+fn executable_available(executable: &str) -> bool {
+    let path = Path::new(executable);
+    if path.is_absolute() || path.components().count() > 1 {
+        path.is_file()
+    } else if cfg!(windows) {
+        command_exists(executable)
+            || command_exists(&format!("{executable}.exe"))
+            || command_exists(&format!("{executable}.cmd"))
+    } else {
+        command_exists(executable)
+    }
+}
+
+fn judge_warning(reachability: &JudgeReachability) -> Option<String> {
+    (reachability.configured && !reachability.reachable).then(|| reachability.reason.clone())
+}
+
+fn print_judge_config(config: &ArcConfig, reachability: &JudgeReachability) {
     let mode = config
         .injection_judge_mode
         .as_deref()
@@ -202,6 +336,14 @@ fn print_judge_config(config: &ArcConfig) {
         .unwrap_or_else(|| "none".to_owned());
     println!("judge mode: {mode}");
     println!("judge model: {model}");
+    println!(
+        "judge reachable: {} ({})",
+        if reachability.reachable { "yes" } else { "no" },
+        reachability.reason
+    );
+    if let Some(warning) = judge_warning(reachability) {
+        println!("WARNING: {warning}");
+    }
     println!("config: {}", arc_config_path().display());
 }
 

@@ -128,7 +128,10 @@ function seamStateLabel(model: ArcUiViewModel): string {
 function judgeStateLabel(model: ArcUiViewModel): string {
   const mode = model.status.judge.mode === "provider-judge" ? "provider" : "embedding";
   const selected = model.status.judge.model;
-  return selected ? `${mode}:${selected.provider}:${selected.id}` : mode;
+  const label = selected ? `${mode}:${selected.provider}:${selected.id}` : mode;
+  return model.status.judge.reachability.configured && !model.status.judge.reachability.reachable
+    ? `${label}:unreachable`
+    : label;
 }
 
 function capsuleStateLabel(capsule: ArcUiCapsuleRow): string {
