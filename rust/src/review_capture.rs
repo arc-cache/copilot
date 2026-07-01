@@ -72,6 +72,52 @@ pub(crate) fn harvest_session(session_id: &str, workspace: &Path) -> Result<bool
     Ok(true)
 }
 
+fn copilot_state_dir() -> PathBuf {
+    env::var("AGENT_RUN_CACHE_COPILOT_STATE_DIR")
+        .map(PathBuf::from)
+        .map(absolutize)
+        .unwrap_or_else(|_| home_dir().join(".copilot/session-state"))
+}
+
+/// Harvest the most recent Copilot session that has not been captured yet.
+///
+/// `arc split` exits when the user force-closes the zellij session (Ctrl+q),
+/// which kills Copilot before it can fire its `SessionEnd` hook. Without this
+/// catch-up, a full split session produces no trace. We scan Copilot's session
+/// state, newest first, and harvest the first session that lacks a saved trace
+/// and is not one of ARC's own sidecar invocations.
+pub(crate) fn harvest_latest_session(workspace: &Path) -> Result<Option<String>> {
+    let entries = match fs::read_dir(copilot_state_dir()) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(None),
+    };
+    let mut sessions: Vec<(std::time::SystemTime, String)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() || !path.join("events.jsonl").exists() {
+            continue;
+        }
+        let Some(id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let mtime = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        sessions.push((mtime, id));
+    }
+    sessions.sort_by(|a, b| b.0.cmp(&a.0));
+    for (_, id) in sessions {
+        if trace_path(&id, workspace).exists() {
+            continue;
+        }
+        if harvest_session(&id, workspace)? {
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
+}
+
 fn read_copilot_transcript_events(
     path: &Path,
     workspace: &Path,
@@ -3007,4 +3053,45 @@ fn exit_code_from_text(text: &str) -> Option<i64> {
     re.captures(text)
         .and_then(|capture| capture.get(1))
         .and_then(|value| value.as_str().parse().ok())
+}
+
+#[cfg(test)]
+mod split_harvest_tests {
+    use super::*;
+    use std::fs;
+
+    // Reproduces the arc split bug: a Copilot session that never fires its
+    // SessionEnd hook (the split is force-closed with Ctrl+q, killing Copilot)
+    // produced no trace. harvest_latest_session must capture it anyway.
+    #[test]
+    fn harvests_session_that_never_fired_session_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("copilot-state");
+        let session_id = "split-session-1";
+        let session_dir = state_dir.join(session_id);
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join("events.jsonl"),
+            "{\"sessionId\":\"split-session-1\",\"type\":\"prompt\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":\"copilot-transcript\",\"text\":\"ran a split session\"}\n",
+        )
+        .unwrap();
+
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        std::env::set_var("AGENT_RUN_CACHE_COPILOT_STATE_DIR", &state_dir);
+
+        // Before the fix nothing harvested this session, so no trace exists.
+        assert!(!trace_path(session_id, &workspace).exists());
+
+        let harvested = harvest_latest_session(&workspace).unwrap();
+
+        std::env::remove_var("AGENT_RUN_CACHE_COPILOT_STATE_DIR");
+
+        assert_eq!(harvested.as_deref(), Some(session_id));
+        assert!(
+            trace_path(session_id, &workspace).exists(),
+            "split session should be harvested into a trace even though SessionEnd never fired"
+        );
+    }
 }
