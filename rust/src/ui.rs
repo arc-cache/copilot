@@ -411,7 +411,7 @@ fn handle_narrow_key(
 ) -> Result<NarrowKeyOutcome> {
     use crossterm::event::KeyCode;
     match code {
-        KeyCode::Char('q') => return Ok(NarrowKeyOutcome::Close),
+        KeyCode::Char('q') if !state.appliance => return Ok(NarrowKeyOutcome::Close),
         KeyCode::Esc | KeyCode::Backspace | KeyCode::Left => {
             if state.narrow_screen == NarrowScreen::Summary {
                 return Ok(if state.appliance {
@@ -844,7 +844,7 @@ fn draw_narrow_summary(
         lines.push(hairline(width));
         lines.push(Line::from(Span::styled(
             if state.appliance {
-                "q close split · Ctrl+q also quits"
+                "close by exiting Copilot"
             } else {
                 "click a row · scroll to read"
             },
@@ -2661,7 +2661,7 @@ mod tests {
     }
 
     #[test]
-    fn split_appliance_closes_on_q_but_not_esc_or_zoom() {
+    fn split_appliance_cannot_self_close_the_arc_pane() {
         use crossterm::event::KeyCode;
 
         let model = test_model();
@@ -2669,13 +2669,10 @@ mod tests {
             appliance: true,
             ..InteractiveUiState::default()
         };
-        // q closes the ARC pane (which chains `zellij action close-tab` to close
-        // the whole split); Esc and f stay inert so they can't close by accident.
-        assert!(matches!(
-            handle_narrow_key(KeyCode::Char('q'), &model, &mut state).unwrap(),
-            NarrowKeyOutcome::Close
-        ));
-        for key in [KeyCode::Esc, KeyCode::Char('f')] {
+        // The ARC pane is a companion viewer with no independent close: it lives
+        // until Copilot exits and closes the whole split. No key closes it, so a
+        // stray q/esc/f can't kill the pane.
+        for key in [KeyCode::Char('q'), KeyCode::Esc, KeyCode::Char('f')] {
             assert!(matches!(
                 handle_narrow_key(key, &model, &mut state).unwrap(),
                 NarrowKeyOutcome::Continue
@@ -2689,7 +2686,7 @@ mod tests {
             .draw(|frame| draw_ui_frame(frame, &model, &state, &mut hit_regions))
             .unwrap();
         let text = terminal_text(&terminal);
-        assert!(text.contains("q close split"));
+        assert!(text.contains("close by exiting Copilot"));
         assert!(!hit_regions
             .iter()
             .any(|region| matches!(&region.action, UiAction::ToggleZoom)));

@@ -274,10 +274,10 @@ mod tests {
         }
         assert!(!SPLIT_LAYOUT.contains("plugin location="));
         assert!(SPLIT_LAYOUT.contains("ARC_SPLIT_APPLIANCE=1"));
-        // Both panes must close the whole split when their command exits, so the
-        // user can leave by exiting Copilot (or pressing q in the ARC pane)
-        // rather than relying on the frequently-intercepted Ctrl+q.
-        assert_eq!(SPLIT_LAYOUT.matches("{{ZELLIJ_BIN}} action close-tab").count(), 2);
+        // Only the Copilot pane closes the split: exiting Copilot closes the
+        // whole tab (ARC pane included). The ARC pane is a companion viewer with
+        // no independent close, so a stray keystroke can't kill the split.
+        assert_eq!(SPLIT_LAYOUT.matches("{{ZELLIJ_BIN}} action close-tab").count(), 1);
         assert!(ZELLIJ_APPLIANCE_PATCH.contains("ARC_ZELLIJ_APPLIANCE"));
         assert!(ZELLIJ_APPLIANCE_PATCH.contains(ZELLIJ_APPLIANCE_VERSION));
     }

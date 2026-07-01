@@ -6,7 +6,7 @@ layout {
                 cwd "{{WORKSPACE}}"
             }
             pane name="ARC" size="30%" command="/bin/sh" {
-                args "-lc" "ARC_SPLIT_APPLIANCE=1 {{ARC_BIN}} ui; {{ZELLIJ_BIN}} action close-tab"
+                args "-lc" "ARC_SPLIT_APPLIANCE=1 {{ARC_BIN}} ui"
                 cwd "{{WORKSPACE}}"
             }
         }
