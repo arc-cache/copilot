@@ -1048,17 +1048,37 @@ fn draw_narrow_capsule_detail(
         if expanded {
             for (index, value) in values.iter().enumerate() {
                 let prefix = format!("{}.", index + 1);
+                let indent = " ".repeat(prefix.len() + 1);
                 let is_command = section == DetailSection::Commands;
                 let suffix = if is_command { " ⧉" } else { "" };
-                let content_width = width.saturating_sub(prefix.len() + 1 + suffix.chars().count());
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, Style::default().fg(Color::DarkGray)),
-                    Span::raw(" "),
-                    Span::raw(clip_text(value, content_width)),
-                    Span::styled(suffix, Style::default().fg(Color::Cyan)),
-                ]));
-                actions.push(None);
-                trailing_actions.push(is_command.then_some(UiAction::CopyCommand(index)));
+                let content_width = width
+                    .saturating_sub(prefix.len() + 1 + suffix.chars().count())
+                    .max(1);
+                let segments = wrap_words(value, content_width);
+                let segments = if segments.is_empty() {
+                    vec![String::new()]
+                } else {
+                    segments
+                };
+                for (segment_index, segment) in segments.iter().enumerate() {
+                    let first = segment_index == 0;
+                    let mut spans = if first {
+                        vec![
+                            Span::styled(prefix.clone(), Style::default().fg(Color::DarkGray)),
+                            Span::raw(" "),
+                        ]
+                    } else {
+                        vec![Span::raw(indent.clone())]
+                    };
+                    spans.push(Span::raw(segment.clone()));
+                    if first && is_command {
+                        spans.push(Span::styled(suffix, Style::default().fg(Color::Cyan)));
+                    }
+                    lines.push(Line::from(spans));
+                    actions.push(None);
+                    trailing_actions
+                        .push((first && is_command).then_some(UiAction::CopyCommand(index)));
+                }
             }
         }
     }
