@@ -840,14 +840,10 @@ fn draw_narrow_summary(
             });
         }
     }
-    if area.height > 13 {
+    if area.height > 13 && !state.appliance {
         lines.push(hairline(width));
         lines.push(Line::from(Span::styled(
-            if state.appliance {
-                "close by exiting Copilot"
-            } else {
-                "click a row · scroll to read"
-            },
+            "click a row · scroll to read",
             Style::default().fg(Color::DarkGray),
         )));
     }
@@ -2686,7 +2682,7 @@ mod tests {
             .draw(|frame| draw_ui_frame(frame, &model, &state, &mut hit_regions))
             .unwrap();
         let text = terminal_text(&terminal);
-        assert!(text.contains("close by exiting Copilot"));
+        assert!(!text.contains("close by exiting Copilot"));
         assert!(!hit_regions
             .iter()
             .any(|region| matches!(&region.action, UiAction::ToggleZoom)));
