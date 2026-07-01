@@ -30,7 +30,11 @@ pub(crate) fn run_split(args: &[String], workspace: &Path) -> Result<()> {
         &SPLIT_LAYOUT
             .replace("{{COPILOT_COMMAND}}", &kdl_escape(&copilot_command))
             .replace("{{WORKSPACE}}", &kdl_escape(&workspace.to_string_lossy()))
-            .replace("{{ARC_BIN}}", &kdl_escape(&arc.to_string_lossy())),
+            .replace("{{ARC_BIN}}", &kdl_escape(&shell_squote(&arc.to_string_lossy())))
+            .replace(
+                "{{ZELLIJ_BIN}}",
+                &kdl_escape(&shell_squote(&zellij.to_string_lossy())),
+            ),
     )?;
 
     let status = Command::new(&zellij)
@@ -44,15 +48,11 @@ pub(crate) fn run_split(args: &[String], workspace: &Path) -> Result<()> {
         .current_dir(workspace)
         .status()
         .with_context(|| format!("failed to start bundled zellij at {}", zellij.display()))?;
-    if !status.success() {
-        return Err(anyhow!(
-            "zellij exited with status {}",
-            status.code().unwrap_or(-1)
-        ));
-    }
-    // Ctrl+q force-closes the split and kills Copilot before it can fire its
-    // SessionEnd hook, so harvest the session that just ran instead of relying
-    // on the hook that never arrives.
+    // Exiting Copilot (or quitting the ARC pane) closes the split via
+    // `zellij action close-tab`, which kills the panes before Copilot can fire
+    // its SessionEnd hook. Harvest the session that just ran regardless of how
+    // zellij exited, so the trace is captured instead of relying on a hook that
+    // never arrives.
     match harvest_latest_session(workspace) {
         Ok(Some(session_id)) => {
             let _ = debug(
@@ -69,6 +69,12 @@ pub(crate) fn run_split(args: &[String], workspace: &Path) -> Result<()> {
                 serde_json::json!({ "error": error.to_string() }),
             );
         }
+    }
+    if !status.success() {
+        return Err(anyhow!(
+            "zellij exited with status {}",
+            status.code().unwrap_or(-1)
+        ));
     }
     Ok(())
 }
@@ -166,6 +172,12 @@ fn kdl_escape(value: &str) -> String {
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
+}
+
+/// Wrap a value in single quotes for safe embedding in a `/bin/sh -lc` string,
+/// so binary paths containing spaces don't get word-split.
+fn shell_squote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn write_generated_file(path: &Path, value: &str) -> Result<()> {
@@ -266,6 +278,10 @@ mod tests {
         }
         assert!(!SPLIT_LAYOUT.contains("plugin location="));
         assert!(SPLIT_LAYOUT.contains("ARC_SPLIT_APPLIANCE=1"));
+        // Both panes must close the whole split when their command exits, so the
+        // user can leave by exiting Copilot (or pressing q in the ARC pane)
+        // rather than relying on the frequently-intercepted Ctrl+q.
+        assert_eq!(SPLIT_LAYOUT.matches("{{ZELLIJ_BIN}} action close-tab").count(), 2);
         assert!(ZELLIJ_APPLIANCE_PATCH.contains("ARC_ZELLIJ_APPLIANCE"));
         assert!(ZELLIJ_APPLIANCE_PATCH.contains(ZELLIJ_APPLIANCE_VERSION));
     }
