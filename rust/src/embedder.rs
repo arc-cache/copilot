@@ -31,10 +31,29 @@ fn embedding_runtime() -> &'static Mutex<ManagedEmbeddingRuntime> {
     })
 }
 
+/// Character budget per embedded text. The managed llama-server runs with an
+/// 8192-token physical batch; anything longer gets a hard 500 ("input is too
+/// large to process"), which used to silently kill retrieval for prompts with
+/// pasted logs. ~4 chars/token keeps us safely under that limit while
+/// preserving the part of the prompt that carries the intent.
+const EMBED_MAX_CHARS: usize = 24_000;
+
+fn clamp_for_embedding(text: &str) -> String {
+    let trimmed = text.trim();
+    if trimmed.len() <= EMBED_MAX_CHARS {
+        return trimmed.to_owned();
+    }
+    let mut end = EMBED_MAX_CHARS;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_owned()
+}
+
 pub(crate) fn embed_texts(texts: &[String], workspace: &Path) -> Result<Option<Vec<Vec<f64>>>> {
     let input = texts
         .iter()
-        .map(|text| text.trim())
+        .map(|text| clamp_for_embedding(text))
         .filter(|text| !text.is_empty())
         .collect::<Vec<_>>();
     if input.is_empty() {
@@ -269,6 +288,10 @@ fn start_embedding_server(
             "--port",
             &port.to_string(),
             "--ctx-size",
+            "8192",
+            "--batch-size",
+            "8192",
+            "--ubatch-size",
             "8192",
             "-ngl",
             "99",
@@ -519,4 +542,24 @@ fn download_stall_timeout_ms() -> u64 {
 
 fn truncate_error(error: &str) -> String {
     truncate(error, 300)
+}
+
+#[cfg(test)]
+mod embed_clamp_tests {
+    use super::*;
+
+    #[test]
+    fn clamps_oversized_text_to_the_embedding_budget() {
+        let long = "x".repeat(EMBED_MAX_CHARS * 2);
+        let clamped = clamp_for_embedding(&long);
+        assert_eq!(clamped.len(), EMBED_MAX_CHARS);
+
+        let short = "  keep me  ";
+        assert_eq!(clamp_for_embedding(short), "keep me");
+
+        let multibyte = "é".repeat(EMBED_MAX_CHARS);
+        let clamped = clamp_for_embedding(&multibyte);
+        assert!(clamped.len() <= EMBED_MAX_CHARS);
+        assert!(clamped.chars().all(|c| c == 'é'));
+    }
 }

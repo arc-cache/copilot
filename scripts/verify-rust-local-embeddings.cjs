@@ -52,6 +52,34 @@ assert.match(debug, /local_embeddings\.runtime_download_(started|completed)/);
 assert.match(debug, /local_embeddings\.model_download_(started|completed)/);
 assert.match(debug, /local_embeddings\.started/);
 
+// Real prompts often carry pasted logs and run past llama-server's default
+// 512-token physical batch, which used to 500 every embed and silently
+// disable injection. Probe with a long prompt to prove big inputs embed.
+const logNoise = "Paramiko reports Timeout opening channel followed by All authentication methods failed while flashing the DUT through the runner proxy. ".repeat(60);
+const longPrompt = `checking CLI JSON output after this failure\n${logNoise}`;
+const longResult = spawnSync(arc, ["probe", longPrompt, "--json"], {
+  cwd: workspace,
+  encoding: "utf8",
+  env: {
+    ...process.env,
+    AGENT_RUN_CACHE_LOCAL_EMBEDDINGS: "on",
+    AGENT_RUN_CACHE_RUNTIME_DIR: runtimeDir,
+    AGENT_RUN_CACHE_MODELS_DIR: modelsDir,
+    AGENT_RUN_CACHE_EMBEDDING_ENDPOINT: "",
+    AGENT_RUN_CACHE_LOCAL_EMBEDDING_ENDPOINT: ""
+  },
+  maxBuffer: 32 * 1024 * 1024
+});
+if (longResult.status !== 0) {
+  process.stderr.write(longResult.stderr);
+  process.stderr.write(longResult.stdout);
+  process.exit(longResult.status ?? 1);
+}
+const longProbe = JSON.parse(longResult.stdout);
+assert.equal(longProbe.source, "local", `long prompt should use local embeddings, got: ${longProbe.reason}`);
+const debugAfter = readFileSync(join(cache, "debug", "runtime.jsonl"), "utf8");
+assert.doesNotMatch(debugAfter, /local_embeddings\.embed_failed/, "long prompt must not fail the embedder");
+
 const modelPath = join(modelsDir, "nomic-embed-text-v1.5.f16.gguf");
 assert.equal(existsSync(modelPath), true);
 
