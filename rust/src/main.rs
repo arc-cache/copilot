@@ -577,9 +577,16 @@ fn run_import_otel(args: &[String], workspace: &Path) -> Result<()> {
 }
 
 fn run_harvest(args: &[String], workspace: &Path) -> Result<()> {
+    if args.iter().any(|arg| arg == "--latest") {
+        match harvest_latest_session(workspace)? {
+            Some(session_id) => println!("harvested {session_id}"),
+            None => println!("no unharvested session found"),
+        }
+        return Ok(());
+    }
     let session_id = args
         .first()
-        .ok_or_else(|| anyhow!("Usage: arc harvest <copilot-session-id>"))?;
+        .ok_or_else(|| anyhow!("Usage: arc harvest <copilot-session-id> | arc harvest --latest"))?;
     if !harvest_session(session_id, workspace)? {
         return Err(anyhow!(
             "No Copilot transcript or OTel data found for session: {session_id}"

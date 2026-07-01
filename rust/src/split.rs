@@ -50,26 +50,22 @@ pub(crate) fn run_split(args: &[String], workspace: &Path) -> Result<()> {
         .with_context(|| format!("failed to start bundled zellij at {}", zellij.display()))?;
     // Exiting Copilot (or quitting the ARC pane) closes the split via
     // `zellij action close-tab`, which kills the panes before Copilot can fire
-    // its SessionEnd hook. Harvest the session that just ran regardless of how
-    // zellij exited, so the trace is captured instead of relying on a hook that
-    // never arrives.
-    match harvest_latest_session(workspace) {
-        Ok(Some(session_id)) => {
-            let _ = debug(
-                workspace,
-                "split.harvested",
-                serde_json::json!({ "sessionId": session_id }),
-            );
-        }
-        Ok(None) => {}
-        Err(error) => {
-            let _ = debug(
-                workspace,
-                "split.harvest_failed",
-                serde_json::json!({ "error": error.to_string() }),
-            );
-        }
-    }
+    // its SessionEnd hook. Harvest the session that just ran so the trace is
+    // captured instead of relying on a hook that never arrives. Run it detached
+    // so the review pipeline (judge/embeddings) can't block the shell after
+    // zellij exits.
+    let spawned = Command::new(&arc)
+        .args(["harvest", "--latest"])
+        .current_dir(workspace)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let _ = debug(
+        workspace,
+        "split.harvest_spawned",
+        serde_json::json!({ "ok": spawned.is_ok() }),
+    );
     if !status.success() {
         return Err(anyhow!(
             "zellij exited with status {}",
