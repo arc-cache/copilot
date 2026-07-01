@@ -135,63 +135,103 @@ pub(crate) fn build_injection_plan(
     let mut sidecar_failure: Option<String> = None;
     let mut judge_decision_id: Option<String> = None;
     if should_judge {
-        match consult_capsule_vault(
-            prompt,
-            &shortlist,
-            workspace,
-            config.injection_judge_model.clone(),
-        ) {
-            Ok(result) => {
-                let accepted = result.applies
-                    && result.capsule_id.is_some()
-                    && (explicit_consult
-                        || judge_confidence(result.confidence)
-                            >= provider_judge_confidence_threshold());
-                if judge_mode == "provider-judge" {
-                    let decision = record_judge_decision(
-                        workspace,
-                        context.session_id.clone(),
-                        prompt,
-                        "provider-judge",
-                        config.injection_judge_model.clone(),
-                        ranked_candidates(&ranked, &shortlist),
-                        if accepted {
-                            JudgeVerdict {
-                                inject: result.capsule_id.clone(),
-                                abstain: None,
-                                confidence: Some(result.confidence.unwrap_or(0.5)),
-                                reason: result.reason.clone(),
-                            }
-                        } else {
-                            JudgeVerdict {
-                                inject: None,
-                                abstain: Some(true),
-                                confidence: Some(result.confidence.unwrap_or(0.5)),
-                                reason: Some(
-                                    result
-                                        .reason
-                                        .clone()
-                                        .unwrap_or_else(|| "judge abstained".to_owned()),
-                                ),
-                            }
-                        },
-                        Some(JudgeOutcome {
-                            injected: Some(accepted),
-                            used: Some("unknown".to_owned()),
-                            helped: Some("unknown".to_owned()),
-                        }),
-                    )?;
-                    judge_decision_id = Some(decision.id);
+        let reachability = judge_reachability(&config);
+        if provider_judge_configured && !reachability.reachable {
+            sidecar_failure = Some(reachability.reason);
+            judge_decision_id = Some(record_unreachable_judge_decision(
+                workspace,
+                context.session_id.clone(),
+                prompt,
+                &config,
+                &ranked,
+                &shortlist,
+                sidecar_failure.as_deref().unwrap(),
+            )?);
+            debug(
+                workspace,
+                "retrieval.sidecar_failed",
+                json!({
+                    "error": "judge reachability check failed",
+                    "reason": sidecar_failure
+                }),
+            )?;
+        } else {
+            match consult_capsule_vault(
+                prompt,
+                &shortlist,
+                workspace,
+                config.injection_judge_model.clone(),
+            ) {
+                Ok(result) => {
+                    let accepted = result.applies
+                        && result.capsule_id.is_some()
+                        && (explicit_consult
+                            || judge_confidence(result.confidence)
+                                >= provider_judge_confidence_threshold());
+                    if judge_mode == "provider-judge" {
+                        let decision = record_judge_decision(
+                            workspace,
+                            context.session_id.clone(),
+                            prompt,
+                            "provider-judge",
+                            config.injection_judge_model.clone(),
+                            ranked_candidates(&ranked, &shortlist),
+                            if accepted {
+                                JudgeVerdict {
+                                    inject: result.capsule_id.clone(),
+                                    abstain: None,
+                                    confidence: Some(result.confidence.unwrap_or(0.5)),
+                                    reason: result.reason.clone(),
+                                }
+                            } else {
+                                JudgeVerdict {
+                                    inject: None,
+                                    abstain: Some(true),
+                                    confidence: Some(result.confidence.unwrap_or(0.5)),
+                                    reason: Some(
+                                        result
+                                            .reason
+                                            .clone()
+                                            .unwrap_or_else(|| "judge abstained".to_owned()),
+                                    ),
+                                }
+                            },
+                            Some(JudgeOutcome {
+                                injected: Some(accepted),
+                                used: Some("unknown".to_owned()),
+                                helped: Some("unknown".to_owned()),
+                            }),
+                        )?;
+                        judge_decision_id = Some(decision.id);
+                    }
+                    sidecar = Some(result);
                 }
-                sidecar = Some(result);
-            }
-            Err(error) => {
-                sidecar_failure = Some(summarize_sidecar_failure(&error.to_string()));
-                debug(
-                    workspace,
-                    "retrieval.sidecar_failed",
-                    json!({ "error": error.to_string(), "reason": sidecar_failure }),
-                )?;
+                Err(error) => {
+                    sidecar_failure = Some(if provider_judge_configured {
+                        format!(
+                            "judge configured but unreachable: {}",
+                            truncate(&error.to_string(), 400)
+                        )
+                    } else {
+                        summarize_sidecar_failure(&error.to_string())
+                    });
+                    if provider_judge_configured {
+                        judge_decision_id = Some(record_unreachable_judge_decision(
+                            workspace,
+                            context.session_id.clone(),
+                            prompt,
+                            &config,
+                            &ranked,
+                            &shortlist,
+                            sidecar_failure.as_deref().unwrap(),
+                        )?);
+                    }
+                    debug(
+                        workspace,
+                        "retrieval.sidecar_failed",
+                        json!({ "error": error.to_string(), "reason": sidecar_failure }),
+                    )?;
+                }
             }
         }
     } else if provider_judge_configured && ranked.available {
@@ -310,12 +350,14 @@ pub(crate) fn build_injection_plan(
         select_capsule(prompt, &candidate_capsules)
     };
     let Some(capsule) = capsule else {
-        return Ok(no_plan(
-            sidecar_failure.as_deref().unwrap_or("no matching capsule"),
-            Some("local"),
-            action_risk,
-        )
-        .with_judge(judge_decision_id));
+        let reason = sidecar_failure.unwrap_or_else(|| {
+            if ranked.available {
+                "no matching capsule".to_owned()
+            } else {
+                ranked.reason.clone()
+            }
+        });
+        return Ok(no_plan(&reason, Some("local"), action_risk).with_judge(judge_decision_id));
     };
     let used = increment_capsule_use(&capsule.id, workspace)?.unwrap_or(capsule);
     Ok(InjectionPlan {
@@ -345,6 +387,37 @@ impl PlanExt for InjectionPlan {
         self.judge_decision_id = judge_decision_id;
         self
     }
+}
+
+fn record_unreachable_judge_decision(
+    workspace: &Path,
+    session_id: Option<String>,
+    prompt: &str,
+    config: &ArcConfig,
+    ranked: &RankedCapsules,
+    shortlist: &[Capsule],
+    reason: &str,
+) -> Result<String> {
+    Ok(record_judge_decision(
+        workspace,
+        session_id,
+        prompt,
+        "provider-judge",
+        config.injection_judge_model.clone(),
+        ranked_candidates(ranked, shortlist),
+        JudgeVerdict {
+            inject: None,
+            abstain: Some(true),
+            confidence: ranked.top_score,
+            reason: Some(reason.to_owned()),
+        },
+        Some(JudgeOutcome {
+            injected: Some(false),
+            used: Some("unknown".to_owned()),
+            helped: Some("unknown".to_owned()),
+        }),
+    )?
+    .id)
 }
 
 fn no_plan(reason: &str, source: Option<&str>, action_risk: Option<String>) -> InjectionPlan {
@@ -406,7 +479,7 @@ fn rank_capsules(prompt: &str, capsules: &[Capsule], workspace: &Path) -> Result
             best: None,
             scores: Vec::new(),
             top_score: None,
-            reason: "embeddings unavailable".to_owned(),
+            reason: embedding_unavailable_reason(),
         });
     };
     let embedded = ensure_embeddings_for_capsules(reusable, workspace)?;

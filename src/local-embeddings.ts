@@ -134,11 +134,17 @@ export async function embedTexts(texts: string[], workspace: string): Promise<nu
     }
     return vectors;
   } catch (error) {
+    setEmbeddingState("error", `local embeddings unavailable: ${truncateError(error)}`);
     await debug("local_embeddings.embed_failed", { error: String(error), count: input.length }, workspace);
     return null;
   } finally {
     clearTimeout(timer);
   }
+}
+
+export function embeddingUnavailableReason(): string {
+  const detail = localEmbeddingInfo().detail.trim().replace(/^local embeddings unavailable:\s*/i, "");
+  return `embeddings unavailable: ${detail || "no embedding runtime detail available"}`;
 }
 
 async function ensureEmbeddingsUnlocked(workspace: string): Promise<LocalEmbeddingInfo> {

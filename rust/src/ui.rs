@@ -1216,6 +1216,23 @@ fn draw_narrow_judge(
         hairline(width),
         Line::raw(""),
         settings_row_line("mode", mode, width, state.narrow_row == 0),
+        settings_row_line(
+            "status",
+            if model.status.judge.reachability.reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            },
+            width,
+            false,
+        ),
+        Line::from(Span::styled(
+            fit_words(
+                &model.status.judge.reachability.reason,
+                width.saturating_sub(2),
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
         hairline(width),
     ];
     let mut actions = vec![
@@ -1223,6 +1240,8 @@ fn draw_narrow_judge(
         None,
         None,
         Some(UiAction::ToggleJudgeMode),
+        None,
+        None,
         None,
     ];
     for (index, choice) in state.judge_models.iter().enumerate() {
@@ -1814,6 +1833,19 @@ fn draw_settings_tab(
     let mut lines = vec![
         settings_line("Mode", mode, state.settings_row == 0),
         settings_line("Model", &selected_model, state.settings_row == 1),
+        settings_line(
+            "Reachability",
+            if model.status.judge.reachability.reachable {
+                "reachable"
+            } else {
+                "unreachable"
+            },
+            false,
+        ),
+        Line::from(Span::styled(
+            model.status.judge.reachability.reason.clone(),
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::raw(""),
         Line::from(Span::styled(
             "Use ↑/↓ to choose a setting, ←/→ or enter to change it. Settings persist to ARC config and are used by hooks, MCP, and probe.",
@@ -2083,11 +2115,16 @@ fn judge_label(judge: &ArcUiJudgeStatus) -> String {
     } else {
         "embedding"
     };
-    judge
+    let label = judge
         .model
         .as_ref()
         .map(|model| format!("{mode}:{}:{}", model.provider, model.id))
-        .unwrap_or_else(|| mode.to_owned())
+        .unwrap_or_else(|| mode.to_owned());
+    if judge.configured_and_unreachable() {
+        format!("{label}:unreachable")
+    } else {
+        label
+    }
 }
 
 fn fit_words(value: &str, max: usize) -> String {
@@ -2178,6 +2215,13 @@ struct ArcUiStatus {
 struct ArcUiJudgeStatus {
     mode: String,
     model: Option<JudgeModel>,
+    reachability: JudgeReachability,
+}
+
+impl ArcUiJudgeStatus {
+    fn configured_and_unreachable(&self) -> bool {
+        self.reachability.configured && !self.reachability.reachable
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -2221,6 +2265,7 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
     let mut capsules = load_capsules(workspace)?;
     let events = load_memory_events(workspace)?;
     let config = load_arc_config()?;
+    let reachability = judge_reachability(&config);
     let injection_pause = injection_pause_status(&config);
     capsules.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let query = options.query.trim().to_owned();
@@ -2263,6 +2308,7 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
                     .injection_judge_mode
                     .unwrap_or_else(|| "embedding-only".to_owned()),
                 model: config.injection_judge_model,
+                reachability,
             },
             injection_pause,
             integration: read_activation_integration(workspace),
@@ -2511,6 +2557,14 @@ mod tests {
                         provider: "ollama".to_owned(),
                         id: "test-judge".to_owned(),
                     }),
+                    reachability: JudgeReachability {
+                        configured: true,
+                        reachable: true,
+                        path: Some("built-in-ollama-api".to_owned()),
+                        check: "static".to_owned(),
+                        reason: "built-in Ollama judge path available; live model not probed"
+                            .to_owned(),
+                    },
                 },
                 injection_pause: InjectionPauseStatus {
                     paused: false,

@@ -25,6 +25,7 @@ import { runArcUi } from "./ui-runtime.js";
 import { copilotTabStatus, installCopilotTab, renderCopilotTabFrame, restoreCopilotTab } from "./copilot-tab.js";
 import { arcConfigPath, loadArcConfig, saveArcConfig } from "./config.js";
 import { listJudgeModels } from "./judge-models.js";
+import { judgeReachability, type JudgeReachability } from "./judge-reachability.js";
 import { loadJudgeDecisions, loadRetrievalReputation } from "./retrieval-reputation.js";
 import { currentArcRuntime, resolveArcOnPath } from "./runtime.js";
 import { loadArcUiViewModel } from "./ui-data.js";
@@ -324,6 +325,9 @@ async function runStatus(args: string[], workspace: string): Promise<void> {
   console.log(`cache: ${payload.cacheDir}`);
   console.log(`capsules: ${payload.capsuleCount}`);
   console.log(`events: ${payload.eventCount}`);
+  const judge = payload.judge as { mode: string; model: { provider: string; id: string } | null; reachability: JudgeReachability };
+  console.log(`judge: ${judge.mode} (${judge.model ? `${judge.model.provider}:${judge.model.id}` : "none"})`);
+  console.log(`judge reachable: ${judge.reachability.reachable ? "yes" : "no"} (${judge.reachability.reason})`);
 }
 
 async function runCapsules(args: string[], workspace: string): Promise<void> {
@@ -468,14 +472,18 @@ async function runJudge(args: string[]): Promise<void> {
     }
     if (model) patch.injectionJudgeModel = parseJudgeModel(model);
     const config = await saveArcConfig(patch);
-    if (json) writeJson({ configPath: arcConfigPath(), config });
-    else printJudgeConfig(config);
+    const reachability = judgeReachability(config);
+    const warning = judgeWarning(reachability);
+    if (json) writeJson({ configPath: arcConfigPath(), config, reachability, warning });
+    else printJudgeConfig(config, reachability);
     return;
   }
   if (subcommand !== "status") throw new Error("Usage: arc judge [status|models|decisions|reputation|set] [--json] [--mode embedding-only|provider-judge] [--model provider:id]");
   const config = await loadArcConfig();
-  if (json) writeJson({ configPath: arcConfigPath(), config });
-  else printJudgeConfig(config);
+  const reachability = judgeReachability(config);
+  const warning = judgeWarning(reachability);
+  if (json) writeJson({ configPath: arcConfigPath(), config, reachability, warning });
+  else printJudgeConfig(config, reachability);
 }
 
 function parseJudgeModel(value: string): { provider: "copilot" | "ollama"; id: string } {
@@ -488,12 +496,19 @@ function parseJudgeModel(value: string): { provider: "copilot" | "ollama"; id: s
   return { provider, id: id.trim() };
 }
 
-function printJudgeConfig(config: Awaited<ReturnType<typeof loadArcConfig>>): void {
+function printJudgeConfig(config: Awaited<ReturnType<typeof loadArcConfig>>, reachability: JudgeReachability): void {
   const mode = config.injectionJudgeMode ?? "embedding-only";
   const model = config.injectionJudgeModel ? `${config.injectionJudgeModel.provider}:${config.injectionJudgeModel.id}` : "none";
   console.log(`judge mode: ${mode}`);
   console.log(`judge model: ${model}`);
+  console.log(`judge reachable: ${reachability.reachable ? "yes" : "no"} (${reachability.reason})`);
+  const warning = judgeWarning(reachability);
+  if (warning) console.log(`WARNING: ${warning}`);
   console.log(`config: ${arcConfigPath()}`);
+}
+
+function judgeWarning(reachability: JudgeReachability): string | null {
+  return reachability.configured && !reachability.reachable ? reachability.reason : null;
 }
 
 async function statusPayload(workspace: string): Promise<Record<string, unknown>> {
@@ -517,7 +532,8 @@ async function statusPayload(workspace: string): Promise<Record<string, unknown>
     hook,
     judge: {
       mode: config.injectionJudgeMode ?? "embedding-only",
-      model: config.injectionJudgeModel ?? null
+      model: config.injectionJudgeModel ?? null,
+      reachability: judgeReachability(config)
     },
     capsuleCount: capsules.length,
     eventCount: events.length,
@@ -663,6 +679,11 @@ async function doctor(args: string[]): Promise<void> {
     runtime,
     configPath: arcConfigPath(),
     sidecarCopilotCommand: config.sidecarCopilotCommand ?? null,
+    judge: {
+      mode: config.injectionJudgeMode ?? "embedding-only",
+      model: config.injectionJudgeModel ?? null,
+      reachability: judgeReachability(config)
+    },
     plugin,
     extension,
     hook,
@@ -685,6 +706,8 @@ async function doctor(args: string[]): Promise<void> {
   console.log(`${arcOnPath.found ? "[OK]" : "[WARN]"} arc on PATH: ${arcOnPath.path ?? "not found - install with npm i -g agent-run-cache"}`);
   console.log(`${runtime.transient ? "[WARN]" : "[OK]"} runtime: ${runtime.node} ${runtime.entrypoint}${runtime.transientReason ? ` (${runtime.transientReason})` : ""}`);
   console.log(`[INFO] config: ${arcConfigPath()}`);
+  const reachability = judgeReachability(config);
+  console.log(`${reachability.reachable ? "[OK]" : "[WARN]"} judge reachability: ${reachability.reason}`);
   console.log(`[INFO] sidecar copilot command: ${config.sidecarCopilotCommand ?? "auto (uses copilot on PATH unless overridden)"}`);
   console.log(`${plugin.installed ? "[OK]" : "[WARN]"} copilot plugin: ${plugin.pluginDir}${plugin.reason ? ` (${plugin.reason})` : ""}`);
   console.log(`[INFO] copilot SDK extension experiment: ${extension.installed ? extension.projectExtensionPath : "not installed"}`);
