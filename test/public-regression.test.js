@@ -7,6 +7,7 @@ import test from "node:test";
 import { redactSensitiveText } from "../dist/redact.js";
 import { buildInjectionPlan } from "../dist/retrieval.js";
 import { reviewEvents } from "../dist/review.js";
+import { reviewPacket } from "../dist/sidecar.js";
 import { maybeReviewTurn } from "../dist/review-decision.js";
 import { loadCapsules, saveCapsule } from "../dist/store.js";
 import { loadMemoryEvents } from "../dist/ledger.js";
@@ -168,6 +169,46 @@ test("redaction handles generic secret assignment names", () => {
   assert.match(redacted, /"PROJECT_API_KEY": <token>/);
   assert.match(redacted, /WORKSPACE_PASSWORD=<token>/);
 });
+
+test("review prompt salvages partial outcomes without allowing positive workflows", withCache(async (workspace) => {
+  let prompt = "";
+  const draft = {
+    packetKind: "assembled_draft",
+    runner: "copilot",
+    sessionId: "partial-prompt-session",
+    workspace,
+    createdAt: new Date().toISOString(),
+    goalId: "partial-goal",
+    mergeKey: "draft:partial-prompt",
+    span: { eventCount: 2 },
+    goal: "inspect a partial result",
+    prompts: ["inspect a partial result"],
+    evidenceSnippets: ["failed command result (exit code 1): check-result"],
+    commands: ["check-result"],
+    parameters: [],
+    paths: [],
+    outcome: {
+      status: "partial",
+      confidence: 0.55,
+      reasons: [],
+      successSignals: [],
+      failureSignals: ["exit code 1"],
+      abortedSignals: []
+    },
+    observations: [],
+    sourceEventIds: []
+  };
+  await reviewPacket(draft, workspace, "user-requested", {
+    reviewer: async (request) => {
+      prompt = request.prompt;
+      return { shouldSave: false, reason: "nothing else reusable" };
+    }
+  });
+
+  assert.match(prompt, /partial, failed, or aborted goal must not become a positive workflow/);
+  assert.match(prompt, /prefer salvaging a concrete caution, dead end, or project fact/);
+  assert.match(prompt, /Decline only when nothing in the evidence could help a future similar session/);
+}));
 
 test("capsule save does not fuzzy-merge across explicit merge keys", withCache(async (workspace) => {
   const sharedWorkflow = {

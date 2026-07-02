@@ -274,7 +274,7 @@ function inferInjectedOutcome(
 }
 
 function capsuleAllowedForOutcome(capsule: NonNullable<SidecarReview["capsules"]>[number], status: string): boolean {
-  if (status !== "failed" && status !== "aborted") return true;
+  if (status !== "partial" && status !== "failed" && status !== "aborted") return true;
   const kind = String(capsule.kind ?? "").toLowerCase();
   if (kind.includes("fact") || kind.includes("dead_end") || kind.includes("caution")) return true;
   const failedAttempts = capsule.workflow?.failedAttempts ?? [];

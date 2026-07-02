@@ -1142,7 +1142,8 @@ Return JSON only. Do not include Markdown.
 
 Rules:
 - Save only if the session shows a reusable method, route, script, command sequence, resolver, or project fact that would help a future similar session.
-- Use packet.outcome. A failed or aborted session must not become a positive workflow. For failed sessions, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted session must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -1276,7 +1277,8 @@ Rules:
 - Save only if the draft shows a reusable method, route, command shape, resolver, project fact, caution, or dead end that would help a future similar session.
 - The local loop is not allowed to author capsules. You own the durable save/decline and capsule prose.
 - Treat commands as verbatim observed commands. Do not invent commands, paths, tools, or validation that are not present in the draft.
-- Use packet.outcome. A failed or aborted goal must not become a positive workflow. For failed goals, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted goal must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -2665,7 +2667,7 @@ fn review_capsules(review: Option<&Value>) -> Vec<Value> {
 }
 
 fn capsule_allowed_for_outcome(capsule: &Value, status: &str) -> bool {
-    if status != "failed" && status != "aborted" {
+    if status != "partial" && status != "failed" && status != "aborted" {
         return true;
     }
     let kind = capsule
@@ -4003,5 +4005,43 @@ mod split_harvest_tests {
             retained[0].get("id").and_then(Value::as_str),
             Some("declined-02")
         );
+    }
+
+    #[test]
+    fn partial_outcomes_salvage_cautions_but_block_positive_workflows() {
+        let positive = json!({
+            "kind": "workflow",
+            "workflow": {
+                "commands": ["run-task"],
+                "successCriteria": ["task exits 0"],
+                "failedAttempts": []
+            }
+        });
+        let caution = json!({
+            "kind": "project_fact",
+            "workflow": {
+                "commands": [],
+                "successCriteria": [],
+                "failedAttempts": ["run-task stopped before validation"]
+            }
+        });
+        assert!(!capsule_allowed_for_outcome(&positive, "partial"));
+        assert!(capsule_allowed_for_outcome(&caution, "partial"));
+
+        let draft = json!({
+            "packetKind": "assembled_draft",
+            "runner": "copilot",
+            "sessionId": "partial-session",
+            "mergeKey": "draft:partial",
+            "goal": "inspect a partial result",
+            "outcome": { "status": "partial" }
+        });
+        let prompt = review_prompt(&draft, &[], None);
+        assert!(prompt.contains(
+            "prefer salvaging a concrete caution, dead end, or project fact"
+        ));
+        assert!(prompt.contains(
+            "Decline only when nothing in the evidence could help a future similar session"
+        ));
     }
 }
