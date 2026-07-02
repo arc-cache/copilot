@@ -857,19 +857,101 @@ function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
 }
 
 function evidenceSnippetsFromPacket(packet: EvidencePacket): string[] {
-  const snippets = [
-    ...packet.toolEvents
+  const startsById = new Map(
+    packet.toolEvents
+      .filter((event) => event.type === "tool_start")
+      .map((event) => [toolEventId(event), event] as const)
+      .filter((entry): entry is [string, EvidencePacket["toolEvents"][number]] => Boolean(entry[0]))
+  );
+  const completedIds = new Set(
+    packet.toolEvents
       .filter((event) => event.type === "tool_end")
-      .map((event) => snippetFromToolEnd(event, packet.workspace))
-      .filter(Boolean),
-    ...packet.assistantMessages.slice(-3).map((message) => cleanSnippet(`assistant: ${message}`, 700, packet.workspace)).filter(Boolean)
-  ];
-  return boundEvidenceSnippets(unique(snippets).slice(-12));
+      .map(toolEventId)
+      .filter((id): id is string => Boolean(id))
+  );
+  const completedCommandEvents = packet.toolEvents
+    .filter((event) => event.type === "tool_end")
+    .map((event) => ({ event, start: startsById.get(toolEventId(event) ?? "") }))
+    .filter(({ event, start }) => event.exitCode !== undefined || Boolean(event.command ?? start?.command));
+  const commandEventIds = new Set(
+    completedCommandEvents.map(({ event }) => toolEventId(event)).filter((id): id is string => Boolean(id))
+  );
+  const completedCommands = completedCommandEvents
+    .map(({ event, start }) => snippetFromCommandResult(event, start, packet.workspace));
+  const failedResults = packet.toolEvents
+    .filter((event) => event.type === "tool_end" && toolEventFailed(event))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !commandEventIds.has(id);
+    })
+    .map((event) => snippetFromToolEnd(event, packet.workspace, 700, true))
+    .filter(Boolean);
+  const incompleteCommands = packet.toolEvents
+    .filter((event) => event.type === "tool_start" && Boolean(event.command))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !completedIds.has(id);
+    })
+    .map((event) => snippetFromIncompleteCommand(event, packet.workspace))
+    .filter(Boolean);
+  const genericResults = packet.toolEvents
+    .filter((event) => event.type === "tool_end" && !toolEventFailed(event))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !commandEventIds.has(id);
+    })
+    .map((event) => snippetFromToolEnd(event, packet.workspace, 350, false))
+    .filter(Boolean);
+  return boundEvidenceSnippets(unique([
+    ...completedCommands.slice(-4),
+    ...failedResults.slice(-3),
+    ...incompleteCommands.slice(-2),
+    ...genericResults.slice(-4),
+    ...packet.assistantMessages.filter((message) => message.trim()).slice(-2).map((message) => cleanSnippet(`assistant: ${message}`, 400, packet.workspace)).filter(Boolean)
+  ]));
 }
 
-function snippetFromToolEnd(event: EvidencePacket["toolEvents"][number], workspace: string): string {
+function toolEventId(event: EvidencePacket["toolEvents"][number]): string | undefined {
+  if (event.toolUseId) return event.toolUseId;
+  if (!event.raw || typeof event.raw !== "object") return undefined;
+  const data = (event.raw as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return undefined;
+  const toolCallId = (data as { toolCallId?: unknown }).toolCallId;
+  return typeof toolCallId === "string" ? toolCallId : undefined;
+}
+
+function toolEventFailed(event: EvidencePacket["toolEvents"][number]): boolean {
+  return event.toolStatus === "failed" || (event.exitCode !== undefined && event.exitCode !== 0);
+}
+
+function snippetFromCommandResult(
+  event: EvidencePacket["toolEvents"][number],
+  start: EvidencePacket["toolEvents"][number] | undefined,
+  workspace: string
+): string {
+  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode !== undefined ? "failed" : "unknown");
+  const result = event.exitCode !== undefined ? `exit code ${event.exitCode}` : `status ${status}`;
+  const command = cleanSnippet(event.command ?? start?.command ?? event.toolName ?? "command", 260, workspace);
+  const output = event.text ? `\noutput tail:\n${cleanTailSnippet(event.text, 420, workspace)}` : "";
+  return cleanSnippet(`${status} command result (${result}): ${command}${output}`, 700, workspace);
+}
+
+function snippetFromIncompleteCommand(event: EvidencePacket["toolEvents"][number], workspace: string): string {
+  return cleanSnippet(
+    `incomplete command (no completion event observed): ${cleanSnippet(event.command ?? "", 340, workspace)}`,
+    400,
+    workspace
+  );
+}
+
+function snippetFromToolEnd(
+  event: EvidencePacket["toolEvents"][number],
+  workspace: string,
+  maxLength: number,
+  useTail: boolean
+): string {
   const label = event.toolName ?? "tool";
-  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode ? "failed" : "unknown");
+  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode !== undefined ? "failed" : "unknown");
   if (event.rawType === "fileChange") {
     const changes = fileChangeSummaries(event.raw, workspace);
     if (changes.length) {
@@ -877,8 +959,10 @@ function snippetFromToolEnd(event: EvidencePacket["toolEvents"][number], workspa
     }
   }
   const command = event.command ? portableSnippetText(`${event.command}`, workspace) : label;
-  const text = event.text ? `\n${event.text}` : "";
-  return cleanSnippet(`${status} ${label}: ${command}${text}`, 900, workspace);
+  const text = event.text
+    ? `\n${useTail ? cleanTailSnippet(event.text, Math.max(0, maxLength - 100), workspace) : cleanSnippet(event.text, Math.max(0, maxLength - 100), workspace)}`
+    : "";
+  return cleanSnippet(`${status} ${label}: ${command}${text}`, maxLength, workspace);
 }
 
 function fileChangeSummaries(raw: unknown, workspace: string): string[] {
@@ -915,6 +999,15 @@ function cleanSnippet(value: string, maxLength: number, workspace: string): stri
     .trim();
   if (compact.length <= maxLength) return compact;
   return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function cleanTailSnippet(value: string, maxLength: number, workspace: string): string {
+  const compact = redactSensitiveText(portableSnippetText(value, workspace))
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (compact.length <= maxLength) return compact;
+  return `...${compact.slice(-Math.max(0, maxLength - 3)).trimStart()}`;
 }
 
 function portableSnippetText(value: string, workspace: string): string {

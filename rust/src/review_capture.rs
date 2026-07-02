@@ -423,6 +423,7 @@ fn normalize_copilot_record(
             tool_name
         });
         event.tool_use_id = text_value(data.get("toolUseId"))
+            .or_else(|| text_value(data.get("toolCallId")))
             .or_else(|| text_value(data.get("id")))
             .or_else(|| text_value(data.get("callId")))
             .filter(|value| !value.is_empty());
@@ -2207,34 +2208,172 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn evidence_snippets_from_packet(packet: &EvidencePacket) -> Vec<String> {
-    let mut snippets = packet
+    let starts_by_id = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_start")
+        .filter_map(|event| tool_event_id(event).map(|id| (id, event)))
+        .collect::<HashMap<_, _>>();
+    let completed_ids = packet
         .tool_events
         .iter()
         .filter(|event| event.type_ == "tool_end")
-        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace))
+        .filter_map(tool_event_id)
+        .collect::<HashSet<_>>();
+    let completed_commands = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end")
+        .filter_map(|event| {
+            let start = tool_event_id(event).and_then(|id| starts_by_id.get(&id).copied());
+            (event.exit_code.is_some()
+                || event.command.is_some()
+                || start.is_some_and(|value| value.command.is_some()))
+            .then(|| snippet_from_command_result(event, start, &packet.workspace))
+        })
         .collect::<Vec<_>>();
+    let command_event_ids = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end")
+        .filter_map(|event| {
+            let id = tool_event_id(event)?;
+            let start = starts_by_id.get(&id).copied();
+            (event.exit_code.is_some()
+                || event.command.is_some()
+                || start.is_some_and(|value| value.command.is_some()))
+            .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    let failed_results = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end" && tool_event_failed(event))
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !command_event_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace, 700, true))
+        .collect::<Vec<_>>();
+    let incomplete_commands = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_start" && event.command.is_some())
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !completed_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_incomplete_command(event, &packet.workspace))
+        .collect::<Vec<_>>();
+    let generic_results = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end" && !tool_event_failed(event))
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !command_event_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace, 350, false))
+        .collect::<Vec<_>>();
+
+    let mut snippets = Vec::new();
+    snippets.extend(tail_items(completed_commands, 4));
+    snippets.extend(tail_items(failed_results, 3));
+    snippets.extend(tail_items(incomplete_commands, 2));
+    snippets.extend(tail_items(generic_results, 4));
     snippets.extend(
         packet
             .assistant_messages
             .iter()
             .rev()
-            .take(3)
-            .map(|message| clean_snippet(&format!("assistant: {message}"), 700, &packet.workspace))
+            .filter(|message| !message.trim().is_empty())
+            .take(2)
+            .map(|message| clean_snippet(&format!("assistant: {message}"), 400, &packet.workspace))
             .filter(|value| !value.is_empty()),
     );
-    bound_evidence_snippets(
-        unique_strings(snippets)
-            .into_iter()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect(),
+    bound_evidence_snippets(unique_strings(snippets))
+}
+
+fn tool_event_id(event: &ArcEvent) -> Option<String> {
+    event.tool_use_id.clone().or_else(|| {
+        event
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("data"))
+            .and_then(|data| data.get("toolCallId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn tool_event_failed(event: &ArcEvent) -> bool {
+    event.tool_status.as_deref() == Some("failed")
+        || event.exit_code.is_some_and(|exit_code| exit_code != 0)
+}
+
+fn tail_items<T>(items: Vec<T>, limit: usize) -> Vec<T> {
+    let skip = items.len().saturating_sub(limit);
+    items.into_iter().skip(skip).collect()
+}
+
+fn snippet_from_command_result(
+    event: &ArcEvent,
+    start: Option<&ArcEvent>,
+    workspace: &str,
+) -> String {
+    let status = event
+        .tool_status
+        .clone()
+        .unwrap_or_else(|| match event.exit_code {
+            Some(0) => "success".to_owned(),
+            Some(_) => "failed".to_owned(),
+            None => "unknown".to_owned(),
+        });
+    let result = event
+        .exit_code
+        .map(|exit_code| format!("exit code {exit_code}"))
+        .unwrap_or_else(|| format!("status {status}"));
+    let command = event
+        .command
+        .as_ref()
+        .or_else(|| start.and_then(|value| value.command.as_ref()))
+        .map(|value| clean_snippet(value, 260, workspace))
+        .unwrap_or_else(|| event.tool_name.as_deref().unwrap_or("command").to_owned());
+    let output = event
+        .text
+        .as_deref()
+        .map(|text| clean_tail_snippet(text, 420, workspace))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("\noutput tail:\n{value}"))
+        .unwrap_or_default();
+    clean_snippet(
+        &format!("{status} command result ({result}): {command}{output}"),
+        700,
+        workspace,
     )
 }
 
-fn snippet_from_tool_end(event: &ArcEvent, workspace: &str) -> Option<String> {
+fn snippet_from_incomplete_command(event: &ArcEvent, workspace: &str) -> Option<String> {
+    let command = event.command.as_ref()?;
+    Some(clean_snippet(
+        &format!(
+            "incomplete command (no completion event observed): {}",
+            clean_snippet(command, 340, workspace)
+        ),
+        400,
+        workspace,
+    ))
+}
+
+fn snippet_from_tool_end(
+    event: &ArcEvent,
+    workspace: &str,
+    max_length: usize,
+    use_tail: bool,
+) -> Option<String> {
     let label = event.tool_name.as_deref().unwrap_or("tool");
     let status = event
         .tool_status
@@ -2249,14 +2388,17 @@ fn snippet_from_tool_end(event: &ArcEvent, workspace: &str) -> Option<String> {
         .as_ref()
         .map(|value| portable_snippet_text(value, workspace))
         .unwrap_or_else(|| label.to_owned());
-    let text = event
-        .text
-        .as_ref()
-        .map(|text| format!("\n{text}"))
-        .unwrap_or_default();
+    let text = event.text.as_ref().map_or_else(String::new, |text| {
+        let excerpt = if use_tail {
+            clean_tail_snippet(text, max_length.saturating_sub(100), workspace)
+        } else {
+            clean_snippet(text, max_length.saturating_sub(100), workspace)
+        };
+        format!("\n{excerpt}")
+    });
     let snippet = clean_snippet(
         &format!("{status} {label}: {command}{text}"),
-        900,
+        max_length,
         workspace,
     );
     if snippet.is_empty() {
@@ -2308,6 +2450,26 @@ fn clean_snippet(value: &str, max_length: usize, workspace: &str) -> String {
             .take(max_length.saturating_sub(3))
             .collect::<String>()
             .trim_end()
+    )
+}
+
+fn clean_tail_snippet(value: &str, max_length: usize, workspace: &str) -> String {
+    let compact = redact_sensitive(&portable_snippet_text(value, workspace))
+        .replace('\r', "")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_owned();
+    let length = compact.chars().count();
+    if length <= max_length {
+        return compact;
+    }
+    format!(
+        "...{}",
+        compact
+            .chars()
+            .skip(length.saturating_sub(max_length.saturating_sub(3)))
+            .collect::<String>()
+            .trim_start()
     )
 }
 
@@ -3143,5 +3305,82 @@ mod split_harvest_tests {
             trace_path(session_id, &workspace).exists(),
             "split session should be harvested into a trace even though SessionEnd never fired"
         );
+    }
+
+    #[test]
+    fn assembled_draft_preserves_completed_command_exit_and_output_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let trace = tmp.path().join("synthetic-trace.jsonl");
+        let session_id = "evidence-session";
+        let mut records = vec![json!({
+            "type": "user.message",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "data": { "content": "verify the build" }
+        })];
+        for index in 0..12 {
+            records.push(json!({
+                "type": "tool.execution_complete",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "data": {
+                    "toolCallId": format!("read-{index}"),
+                    "success": true,
+                    "result": { "content": "source listing ".repeat(100) }
+                }
+            }));
+        }
+        records.push(json!({
+            "type": "tool.execution_start",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {
+                "toolCallId": "command-1",
+                "toolName": "bash",
+                "arguments": { "command": "run-build --check" }
+            }
+        }));
+        records.push(json!({
+            "type": "tool.execution_complete",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "data": {
+                "toolCallId": "command-1",
+                "success": true,
+                "result": {
+                    "content": format!(
+                        "{}\nBUILD_OUTPUT_CONFIRMED\n<shellId: 1 completed with exit code 0>",
+                        "old output\n".repeat(100)
+                    )
+                }
+            }
+        }));
+        fs::write(
+            &trace,
+            records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let events = read_copilot_transcript_events(&trace, &workspace, session_id).unwrap();
+        let packet = build_evidence_packet(&events, &workspace, session_id);
+        let draft = strong_review_input(&packet, "auto").unwrap();
+        let evidence = draft
+            .get("evidenceSnippets")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            draft.get("packetKind").and_then(Value::as_str),
+            Some("assembled_draft")
+        );
+        assert!(evidence.contains("exit code 0"), "{evidence}");
+        assert!(evidence.contains("BUILD_OUTPUT_CONFIRMED"), "{evidence}");
+        assert!(evidence.contains("run-build --check"), "{evidence}");
     }
 }
