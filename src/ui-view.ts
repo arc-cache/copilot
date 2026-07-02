@@ -165,6 +165,7 @@ function eventTypeLabel(type: string): string {
     "capsule.created": "Capsule saved",
     "capsule.updated": "Capsule updated",
     "capsule.finalized": "Capsule finalized",
+    "capsule.promoted": "Declined draft promoted",
     "capsule.injected": "Capsule injected",
     "capsule.rejected": "Capture skipped",
     "capsule.superseded": "Capsule invalidated",

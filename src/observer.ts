@@ -173,7 +173,8 @@ export function startLiveObserver(options: LiveObserverOptions): LiveObserver {
         sessionId,
         draft.outcome.status,
         review?.reason ?? "no review",
-        workspace
+        workspace,
+        draft
       );
     }
   };

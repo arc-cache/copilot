@@ -43,7 +43,8 @@ use plugin::{
 use retrieval::{build_injection_plan, ensure_embeddings_for_capsules, search_capsules_for_query};
 use review_capture::{
     harvest_latest_session, harvest_session, import_copilot_otel, import_copilot_transcript,
-    record_sidecar_exchange, review_events, run_judge_sidecar, value_array_strings,
+    load_declined_draft_views, promote_declined_draft, record_sidecar_exchange, review_events,
+    run_judge_sidecar, value_array_strings,
 };
 use split::{cached_zellij, run_split};
 use store::{increment_capsule_use, load_capsules, save_capsule, update_capsule_metadata};
@@ -129,6 +130,12 @@ fn run_status(args: &[String], workspace: &Path) -> Result<()> {
 fn run_capsules(args: &[String], workspace: &Path) -> Result<()> {
     let json_mode = has_json(args);
     let clean = strip_flag(args, "--json");
+    if clean.first().map(String::as_str) == Some("declined") {
+        return run_capsules_declined(&clean[1..], workspace, json_mode);
+    }
+    if clean.first().map(String::as_str) == Some("promote") {
+        return run_capsule_promote(&clean[1..], workspace, json_mode);
+    }
     if clean.first().map(String::as_str) == Some("set") {
         return run_capsule_set(&clean[1..], workspace, json_mode);
     }
@@ -171,6 +178,57 @@ fn run_capsules(args: &[String], workspace: &Path) -> Result<()> {
             );
         }
         Ok(())
+    }
+}
+
+fn run_capsules_declined(args: &[String], workspace: &Path, json_mode: bool) -> Result<()> {
+    assert_known_flags(args, &[])?;
+    let declined = load_declined_draft_views(workspace)?;
+    if json_mode {
+        return write_json(&json!({ "declined": declined }));
+    }
+    println!(
+        "{} declined draft{}",
+        declined.len(),
+        if declined.len() == 1 { "" } else { "s" }
+    );
+    for draft in declined {
+        println!(
+            "{}  {}  {}  {}",
+            short(&draft.id, 18),
+            draft.outcome,
+            age_from_seconds(draft.age_seconds),
+            draft.title
+        );
+        println!("  {}", truncate(&draft.reason, 120));
+    }
+    Ok(())
+}
+
+fn run_capsule_promote(args: &[String], workspace: &Path, json_mode: bool) -> Result<()> {
+    assert_known_flags(args, &[])?;
+    let id = args
+        .first()
+        .ok_or_else(|| anyhow!("Usage: arc capsules promote <id> [--json]"))?;
+    let (declined_draft_id, capsule) = promote_declined_draft(id, workspace)?;
+    if json_mode {
+        write_json(&json!({
+            "declinedDraftId": declined_draft_id,
+            "capsule": capsule_json_with_scope(&capsule)
+        }))
+    } else {
+        println!("promoted {} to capsule {}", declined_draft_id, capsule.id);
+        Ok(())
+    }
+}
+
+fn age_from_seconds(seconds: i64) -> String {
+    if seconds >= 86_400 {
+        format!("{}d", seconds / 86_400)
+    } else if seconds >= 3_600 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}m", seconds / 60)
     }
 }
 
@@ -1311,6 +1369,26 @@ struct DeclinedDraftRecord {
     session_id: String,
     outcome: String,
     reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    draft: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promoted_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promoted_capsule_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DeclinedDraftView {
+    id: String,
+    merge_key: String,
+    title: String,
+    summary: String,
+    session_id: String,
+    outcome: String,
+    reason: String,
+    created_at: String,
+    age_seconds: i64,
 }
 
 #[allow(dead_code)]

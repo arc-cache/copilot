@@ -1104,10 +1104,7 @@ fn recurrence_context(
     let mut prior_session_ids = Vec::new();
     let mut seen = HashSet::new();
     let mut prior_reason = String::new();
-    for value in read_jsonl_values(&declined_path(workspace))? {
-        let Ok(record) = serde_json::from_value::<DeclinedDraftRecord>(value) else {
-            continue;
-        };
+    for record in load_retained_declined_drafts(workspace)? {
         if record.merge_key != merge_key
             || record.session_id == session_id
             || !seen.insert(record.session_id.clone())
@@ -2862,8 +2859,304 @@ fn record_declined_draft(
         session_id: session_id.to_owned(),
         outcome: outcome.to_owned(),
         reason: reason.to_owned(),
+        draft: Some(redact_json(review_input)),
+        promoted_at: None,
+        promoted_capsule_id: None,
     };
-    append_jsonl(&declined_path(workspace), &record)
+    let mut records = load_retained_declined_drafts(workspace)?;
+    records.retain(|existing| existing.id != record.id);
+    records.push(record);
+    write_retained_declined_drafts(workspace, records)
+}
+
+pub(crate) fn load_declined_draft_views(workspace: &Path) -> Result<Vec<DeclinedDraftView>> {
+    let mut records = load_retained_declined_drafts(workspace)?
+        .into_iter()
+        .filter(|record| record.promoted_capsule_id.is_none())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(records
+        .into_iter()
+        .map(|record| declined_draft_view(&record))
+        .collect())
+}
+
+pub(crate) fn promote_declined_draft(
+    id_or_prefix: &str,
+    workspace: &Path,
+) -> Result<(String, Capsule)> {
+    let mut records = load_retained_declined_drafts(workspace)?;
+    let index = records
+        .iter()
+        .position(|record| record.id == id_or_prefix || record.id.starts_with(id_or_prefix))
+        .ok_or_else(|| anyhow!("No declined draft matches {id_or_prefix}"))?;
+    if let Some(capsule_id) = records[index].promoted_capsule_id.as_deref() {
+        let capsule = load_capsules(workspace)?
+            .into_iter()
+            .find(|capsule| capsule.id == capsule_id)
+            .ok_or_else(|| anyhow!("Declined draft was promoted, but its capsule is missing"))?;
+        return Ok((records[index].id.clone(), capsule));
+    }
+    let draft = records[index]
+        .draft
+        .as_ref()
+        .ok_or_else(|| anyhow!("Declined draft predates recoverable draft storage"))?;
+    let capsule = capsule_from_declined_draft(&records[index], draft, workspace)?;
+    let saved = save_capsule(capsule, workspace)?
+        .ok_or_else(|| anyhow!("Declined draft could not be promoted"))?;
+    let declined_id = records[index].id.clone();
+    records[index].promoted_at = Some(now_iso());
+    records[index].promoted_capsule_id = Some(saved.id.clone());
+    write_retained_declined_drafts(workspace, records)?;
+    record_memory_event(
+        workspace,
+        "capsule.promoted",
+        Some(saved.source_session_id.clone()),
+        None,
+        Some(saved.id.clone()),
+        Some(json!({
+            "declinedDraftId": declined_id,
+            "promotedBy": "user",
+            "title": saved.title,
+            "reason": "user promoted a declined draft"
+        })),
+    )?;
+    record_judge_decision(
+        workspace,
+        Some(saved.source_session_id.clone()),
+        &format!("user promoted declined draft {declined_id}"),
+        "user-override",
+        None,
+        vec![JudgeCandidate {
+            capsule_id: saved.id.clone(),
+            score: 1.0,
+            reputation: None,
+        }],
+        JudgeVerdict {
+            inject: Some(saved.id.clone()),
+            abstain: Some(false),
+            confidence: Some(1.0),
+            reason: Some("user promoted a previously declined draft".to_owned()),
+        },
+        Some(JudgeOutcome {
+            injected: Some(true),
+            used: Some("yes".to_owned()),
+            helped: Some("yes".to_owned()),
+        }),
+    )?;
+    Ok((declined_id, saved))
+}
+
+fn capsule_from_declined_draft(
+    record: &DeclinedDraftRecord,
+    draft: &Value,
+    workspace: &Path,
+) -> Result<Capsule> {
+    let goal = draft
+        .get("goal")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            draft
+                .get("prompts")
+                .and_then(Value::as_array)
+                .and_then(|values| values.iter().rev().find_map(Value::as_str))
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("Recovered declined method");
+    let evidence = value_array_strings(draft.get("evidenceSnippets"));
+    let commands = value_array_strings(draft.get("commands"));
+    let parameters = value_array_strings(draft.get("parameters"));
+    let paths = value_array_strings(draft.get("paths"));
+    let successful = record.outcome == "success";
+    let title = truncate(goal, 100);
+    let summary = if successful {
+        format!("User-promoted method recovered from verified evidence: {title}")
+    } else {
+        format!(
+            "User-promoted caution recovered from a {} goal: {title}",
+            record.outcome
+        )
+    };
+    let success_evidence = evidence
+        .iter()
+        .filter(|value| {
+            let normalized = value.to_lowercase();
+            normalized.contains("success") || normalized.contains("exit code 0")
+        })
+        .cloned()
+        .take(4)
+        .collect::<Vec<_>>();
+    let mut capsule = Capsule {
+        runner: draft
+            .get("runner")
+            .and_then(Value::as_str)
+            .unwrap_or("copilot")
+            .to_owned(),
+        workspace: workspace.to_string_lossy().to_string(),
+        source_session_id: record.session_id.clone(),
+        source_session_ids: vec![record.session_id.clone()],
+        status: "local".to_owned(),
+        privacy_label: "local".to_owned(),
+        kind: if successful {
+            "workflow".to_owned()
+        } else {
+            "project_fact".to_owned()
+        },
+        merge_key: record.merge_key.clone(),
+        title,
+        summary,
+        reusable: true,
+        confidence: if successful { 0.5 } else { 0.35 },
+        reuse_when: vec![goal.to_owned()],
+        do_not_reuse_when: if successful {
+            Vec::new()
+        } else {
+            vec![format!(
+                "when the {} outcome has not been independently revalidated",
+                record.outcome
+            )]
+        },
+        evidence,
+        provenance: vec![
+            "promoted-by-user".to_owned(),
+            format!("declinedDraft:{}", record.id),
+        ],
+        confidence_reason: format!(
+            "Conservative confidence because the reviewer declined this {} draft before explicit user promotion.",
+            record.outcome
+        ),
+        failure_boundary: if successful {
+            vec![format!("Original reviewer declined capture: {}", record.reason)]
+        } else {
+            vec![format!(
+                "Original outcome was {}; do not treat this as a verified positive workflow.",
+                record.outcome
+            )]
+        },
+        validation_provenance: vec![
+            format!("original draft outcome: {}", record.outcome),
+            "promoted explicitly by user".to_owned(),
+        ],
+        outcome_status: record.outcome.clone(),
+        next_run_instruction: if successful {
+            format!("Reuse the recorded method for {goal}, then verify the same success evidence.")
+        } else {
+            format!(
+                "Treat the prior {} result as a caution and verify fresh evidence before acting.",
+                record.outcome
+            )
+        },
+        workflow: WorkflowCapsule {
+            purpose: goal.to_owned(),
+            parameters,
+            binding_sources: paths.into_iter().take(12).collect(),
+            steps: if successful {
+                commands.clone()
+            } else {
+                vec!["Inspect the recorded failure evidence before choosing a new route.".to_owned()]
+            },
+            commands: if successful {
+                commands.clone()
+            } else {
+                Vec::new()
+            },
+            success_criteria: if successful {
+                success_evidence
+            } else {
+                Vec::new()
+            },
+            failed_attempts: if successful {
+                Vec::new()
+            } else {
+                commands.clone()
+            },
+            validation_probe: if successful {
+                commands.last().cloned().into_iter().collect()
+            } else {
+                Vec::new()
+            },
+        },
+        ..Capsule::default()
+    };
+    capsule.artifact_sources = value_array_strings(draft.get("artifactSources"));
+    Ok(capsule)
+}
+
+fn load_retained_declined_drafts(workspace: &Path) -> Result<Vec<DeclinedDraftRecord>> {
+    let cutoff = Utc::now() - chrono::Duration::days(30);
+    let mut records = read_jsonl_values(&declined_path(workspace))?
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<DeclinedDraftRecord>(value).ok())
+        .filter(|record| {
+            DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created| created.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    if records.len() > 50 {
+        records.drain(0..records.len() - 50);
+    }
+    Ok(records)
+}
+
+fn write_retained_declined_drafts(
+    workspace: &Path,
+    records: Vec<DeclinedDraftRecord>,
+) -> Result<()> {
+    let cutoff = Utc::now() - chrono::Duration::days(30);
+    let mut records = records
+        .into_iter()
+        .filter(|record| {
+            DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created| created.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    if records.len() > 50 {
+        records.drain(0..records.len() - 50);
+    }
+    write_jsonl(&declined_path(workspace), &records)
+}
+
+fn declined_draft_view(record: &DeclinedDraftRecord) -> DeclinedDraftView {
+    let title = record
+        .draft
+        .as_ref()
+        .and_then(|draft| draft.get("goal"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| truncate(value, 100))
+        .unwrap_or_else(|| "Declined capture".to_owned());
+    let summary = record
+        .draft
+        .as_ref()
+        .and_then(|draft| draft.get("evidenceSnippets"))
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .map(|value| truncate(value, 180))
+        .unwrap_or_else(|| format!("{} outcome", record.outcome));
+    let age_seconds = DateTime::parse_from_rfc3339(&record.created_at)
+        .map(|created| {
+            (Utc::now() - created.with_timezone(&Utc))
+                .num_seconds()
+                .max(0)
+        })
+        .unwrap_or(0);
+    DeclinedDraftView {
+        id: record.id.clone(),
+        merge_key: record.merge_key.clone(),
+        title,
+        summary,
+        session_id: record.session_id.clone(),
+        outcome: record.outcome.clone(),
+        reason: record.reason.clone(),
+        created_at: record.created_at.clone(),
+        age_seconds,
+    }
 }
 
 fn add_recurrence_provenance(
@@ -3666,6 +3959,49 @@ mod split_harvest_tests {
                 .and_then(|values| values.first())
                 .and_then(Value::as_str),
             Some("recurrenceCount: 2")
+        );
+    }
+
+    #[test]
+    fn declined_ledger_keeps_only_fifty_recent_drafts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut records = (0..52)
+            .map(|index| DeclinedDraftRecord {
+                id: format!("declined-{index:02}"),
+                merge_key: format!("draft:{index:02}"),
+                created_at: (Utc::now() + chrono::Duration::seconds(index)).to_rfc3339(),
+                session_id: format!("session-{index:02}"),
+                outcome: "success".to_owned(),
+                reason: "one-off".to_owned(),
+                draft: Some(json!({ "goal": format!("goal {index}") })),
+                promoted_at: None,
+                promoted_capsule_id: None,
+            })
+            .collect::<Vec<_>>();
+        records.push(DeclinedDraftRecord {
+            id: "declined-old".to_owned(),
+            merge_key: "draft:old".to_owned(),
+            created_at: (Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
+            session_id: "session-old".to_owned(),
+            outcome: "success".to_owned(),
+            reason: "old".to_owned(),
+            draft: None,
+            promoted_at: None,
+            promoted_capsule_id: None,
+        });
+
+        write_retained_declined_drafts(&workspace, records).unwrap();
+        let retained = read_jsonl_values(&declined_path(&workspace)).unwrap();
+
+        assert_eq!(retained.len(), 50);
+        assert!(retained
+            .iter()
+            .all(|value| value.get("id").and_then(Value::as_str) != Some("declined-old")));
+        assert_eq!(
+            retained[0].get("id").and_then(Value::as_str),
+            Some("declined-02")
         );
     }
 }

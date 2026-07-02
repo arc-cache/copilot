@@ -11,7 +11,7 @@ export interface JudgeDecisionRecord {
   workspace: string;
   sessionId?: string;
   promptHash: string;
-  mode: "embedding-only" | "provider-judge";
+  mode: "embedding-only" | "provider-judge" | "user-override";
   model?: { provider: "copilot" | "ollama"; id: string };
   candidates: { capsuleId: string; score: number; reputation?: number }[];
   verdict: { inject?: string; abstain?: boolean; confidence?: number; reason?: string };

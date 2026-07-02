@@ -849,7 +849,7 @@ function strongReviewInput(packet: ReviewPacket, intent: ReviewIntent): ReviewPa
   return assembledDraftFromEvidence(packet);
 }
 
-function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
+export function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
   const sourceEventIds = packet.toolEvents.map((event) => event.id);
   return {
     packetKind: "assembled_draft",

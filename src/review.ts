@@ -4,7 +4,7 @@ import { recordMemoryEvent } from "./ledger.js";
 import { workspaceRoot } from "./paths.js";
 import { refreshCapsuleDerivedData } from "./retrieval.js";
 import { recordJudgeOutcome } from "./retrieval-reputation.js";
-import { draftMergeKeyFromEvidence, reviewPacket } from "./sidecar.js";
+import { assembledDraftFromEvidence, draftMergeKeyFromEvidence, reviewPacket } from "./sidecar.js";
 import { alreadyReviewed, debug, recordReview, saveCapsule, traceHash, withReviewLock } from "./store.js";
 import type { ReviewRecord } from "./store.js";
 import type { ArcEvent, ReviewIntent, SidecarReview, SidecarReviewOptions } from "./types.js";
@@ -69,6 +69,7 @@ async function reviewEventsUnlocked(
   options: SidecarReviewOptions
 ): Promise<ReviewOutcome> {
   const packet = buildEvidencePacket(events, workspace, sessionId);
+  const reviewDraft = assembledDraftFromEvidence(packet);
   const mergeKey = draftMergeKeyFromEvidence(packet);
   const recurrence = await reviewRecurrence(mergeKey, sessionId, workspace);
   const hash = traceHash(events);
@@ -166,7 +167,7 @@ async function reviewEventsUnlocked(
           sessionId,
           details: { reason, outcome: packet.outcome.status, eventCount: events.length }
         });
-        await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace);
+        await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace, reviewDraft);
         const result: ReviewOutcome = { status: "no_capsule", reason };
         await reconcileJudgeOutcome(workspace, sessionId, packet, options, result, correction);
         return result;
@@ -203,7 +204,7 @@ async function reviewEventsUnlocked(
           correctionReasons: correction.detected ? correction.reasons : undefined
         }
       });
-      await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace);
+      await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace, reviewDraft);
       const result: ReviewOutcome = { status: "no_capsule", reason };
       await reconcileJudgeOutcome(workspace, sessionId, packet, options, result, correction);
       return result;
