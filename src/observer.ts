@@ -1,10 +1,11 @@
 import { createHash } from "node:crypto";
 
+import { recordDeclinedDraft, reviewRecurrence } from "./declined.js";
 import { buildEvidencePacket } from "./evidence.js";
 import { appendJsonl } from "./json.js";
 import { observerPath } from "./paths.js";
 import { refreshCapsuleDerivedData } from "./retrieval.js";
-import { observePacket, reviewPacket } from "./sidecar.js";
+import { draftMergeKeyFromEvidence, observePacket, reviewPacket } from "./sidecar.js";
 import { debug, saveCapsule } from "./store.js";
 import type { ArcEvent, AssembledDraft, ObserverJudgment, ObserverPacket, SidecarReview } from "./types.js";
 
@@ -140,12 +141,17 @@ export function startLiveObserver(options: LiveObserverOptions): LiveObserver {
       commandCount: draft.commands.length,
       outcome: draft.outcome.status
     }, workspace);
-    const review = await reviewPacket(draft, workspace);
+    const recurrence = await reviewRecurrence(draft.mergeKey, sessionId, workspace);
+    const review = await reviewPacket(draft, workspace, "auto", { recurrence });
     const saved: string[] = [];
     for (const capsuleInput of reviewCapsules(review).filter((capsule) => capsuleAllowedForOutcome(capsule, draft.outcome.status))) {
       const capsule = await saveCapsule({
         ...capsuleInput,
         sourceSessionId: `${sessionId}:${draft.goalId}`,
+        sourceSessionIds: recurrence ? [...recurrence.priorSessionIds, sessionId] : capsuleInput.sourceSessionIds,
+        provenance: recurrence
+          ? [...(capsuleInput.provenance ?? []), `recurrenceCount: ${recurrence.recurrenceCount}`]
+          : capsuleInput.provenance,
         workspace,
         runner: draft.runner,
         outcomeStatus: draft.outcome.status
@@ -161,6 +167,15 @@ export function startLiveObserver(options: LiveObserverOptions): LiveObserver {
       capsuleIds: saved,
       reason: review?.reason
     }, workspace);
+    if (!saved.length) {
+      await recordDeclinedDraft(
+        draft.mergeKey,
+        sessionId,
+        draft.outcome.status,
+        review?.reason ?? "no review",
+        workspace
+      );
+    }
   };
 
   const schedule = (delay: number): void => {
@@ -207,6 +222,7 @@ function buildAssembledDraft(
     workspace,
     createdAt: new Date().toISOString(),
     goalId: hash(sourceEventIds.join("\n")).slice(0, 12),
+    mergeKey: draftMergeKeyFromEvidence(packet),
     span: {
       startEventId: events[0]?.id,
       endEventId: events.at(-1)?.id,

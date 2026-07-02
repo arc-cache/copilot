@@ -5,6 +5,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { appendJsonl, extractJsonObject } from "./json.js";
 import { copilotSidecarCommand } from "./copilot-command.js";
 import { cleanupSidecarCopilotSessions, listCopilotSessionIds } from "./copilot-sessions.js";
+import { reviewRecurrence } from "./declined.js";
 import { sidecarPath } from "./paths.js";
 import { redactJson, redactSensitiveText } from "./redact.js";
 import { debug, loadCapsules } from "./store.js";
@@ -35,15 +36,20 @@ export async function reviewPacket(
   intent: ReviewIntent = "auto",
   options: SidecarReviewOptions = {}
 ): Promise<SidecarReview | null> {
+  const reviewInput = strongReviewInput(packet, intent);
+  const recurrence = options.recurrence ?? await reviewRecurrence(
+    isAssembledDraft(reviewInput) ? reviewInput.mergeKey : draftMergeKeyFromEvidence(packet as EvidencePacket),
+    packet.sessionId,
+    workspace
+  );
   // A user-requested save is an explicit decision; the observer gate only
   // filters reviews ARC initiates on its own.
-  if (intent === "auto") {
+  if (intent === "auto" && !recurrence) {
     const gated = await reviewGateFromObserver(packet, workspace);
     if (gated) return gated;
   }
   const existingCapsules = await reviewCandidateCapsules(packet, workspace, options);
-  const reviewInput = strongReviewInput(packet, intent);
-  const reviewContext = reviewContextFromOptions(options);
+  const reviewContext = reviewContextFromOptions({ ...options, recurrence });
   const command = process.env.AGENT_RUN_CACHE_REVIEWER_COMMAND;
   if (command) {
     const input = JSON.stringify(reviewContext ? { ...reviewInput, reviewContext } : reviewInput);
@@ -89,7 +95,7 @@ export async function reviewPacket(
   return parsed;
 }
 
-type ReviewContext = Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds">;
+type ReviewContext = Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds" | "recurrence">;
 
 function reviewContextFromOptions(options: SidecarReviewOptions): ReviewContext | undefined {
   const context: ReviewContext = {
@@ -98,7 +104,8 @@ function reviewContextFromOptions(options: SidecarReviewOptions): ReviewContext 
     consultAbstainReason: options.consultAbstainReason,
     actionRisk: options.actionRisk,
     injectedCapsuleIds: options.injectedCapsuleIds,
-    judgeDecisionIds: options.judgeDecisionIds
+    judgeDecisionIds: options.judgeDecisionIds,
+    recurrence: options.recurrence
   };
   return Object.values(context).some((value) => value !== undefined) ? context : undefined;
 }
@@ -529,10 +536,8 @@ Candidate rules:
 }
 
 function reviewPrompt(packet: ReviewPacket, existingCapsules: Capsule[] = [], reviewContext?: ReviewContext): string {
-  if (isAssembledDraft(packet)) return assembledDraftReviewPrompt(packet, existingCapsules);
-  const contextBlock = reviewContext
-    ? `\nARC review context from pre-turn retrieval:\n${JSON.stringify(reviewContext).slice(0, 2000)}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n`
-    : "";
+  if (isAssembledDraft(packet)) return assembledDraftReviewPrompt(packet, existingCapsules, reviewContext);
+  const contextBlock = reviewContextPromptBlock(reviewContext);
   return `You are the Agent Run Cache sidecar.
 
 Your job is to decide whether a completed coding-agent session produced one or more reusable workflow capsules.
@@ -628,7 +633,20 @@ Evidence packet:
 ${JSON.stringify(packet).slice(0, 60000)}`;
 }
 
-function assembledDraftReviewPrompt(packet: AssembledDraft, existingCapsules: Capsule[] = []): string {
+function reviewContextPromptBlock(reviewContext?: ReviewContext): string {
+  if (!reviewContext) return "";
+  let block = `\nARC review context from pre-turn retrieval:\n${JSON.stringify(reviewContext).slice(0, 2000)}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n`;
+  if (reviewContext.recurrence) {
+    block += `This method has been observed ${reviewContext.recurrence.recurrenceCount} times across sessions (previously declined: ${reviewContext.recurrence.priorDeclineReason.slice(0, 500)}). Recurrence is evidence of reusability; prefer saving with provenance noting both sessions. You still own the save or decline decision.\n`;
+  }
+  return block;
+}
+
+function assembledDraftReviewPrompt(
+  packet: AssembledDraft,
+  existingCapsules: Capsule[] = [],
+  reviewContext?: ReviewContext
+): string {
   return `You are the Agent Run Cache sidecar.
 
 ARC's local loop assembled this draft at a goal boundary. The draft is not a capsule and it is not authoritative prose; it is a compact evidence object made from typed events and local observations.
@@ -651,6 +669,7 @@ Rules:
 - Do not copy private IPs, MAC addresses, token values, personal home paths, or full remote URLs. Use stable placeholders such as <private-ip>, <mac-address>, <token>, <home>, and <url>.
 - If nothing durable was learned, return {"shouldSave": false, "reason": "..."}.
 ${existingCapsuleContext(existingCapsules)}
+${reviewContextPromptBlock(reviewContext)}
 
 Return the same JSON shape as normal ARC reviews:
 {
@@ -839,6 +858,7 @@ function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
     workspace: packet.workspace,
     createdAt: new Date().toISOString(),
     goalId: sha256([packet.sessionId, packet.eventCount, ...sourceEventIds].join("\n")).slice(0, 12),
+    mergeKey: draftMergeKeyFromEvidence(packet),
     span: {
       startEventId: sourceEventIds[0],
       endEventId: sourceEventIds.at(-1),
@@ -854,6 +874,21 @@ function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
     observations: [],
     sourceEventIds
   };
+}
+
+export function draftMergeKeyFromEvidence(packet: EvidencePacket): string {
+  const source = packet.commands.some((value) => value.trim())
+    ? packet.commands.slice(-6)
+    : packet.prompts.slice(-3);
+  const normalized = source
+    .map((value) => portableSnippetText(redactSensitiveText(value), packet.workspace)
+      .split(/\s+/)
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase())
+    .filter(Boolean)
+    .join("\n");
+  return normalized ? `draft:${sha256(normalized).slice(0, 20)}` : "";
 }
 
 function evidenceSnippetsFromPacket(packet: EvidencePacket): string[] {

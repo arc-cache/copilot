@@ -1302,6 +1302,17 @@ struct ReviewRecord {
     created_at: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeclinedDraftRecord {
+    id: String,
+    merge_key: String,
+    created_at: String,
+    session_id: String,
+    outcome: String,
+    reason: String,
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct ReviewOutcome {
@@ -2315,6 +2326,12 @@ fn reviewed_path(workspace: &Path) -> PathBuf {
     ensure_cache(workspace)
         .unwrap_or_else(|_| cache_dir(workspace))
         .join("reviewed.jsonl")
+}
+
+fn declined_path(workspace: &Path) -> PathBuf {
+    ensure_cache(workspace)
+        .unwrap_or_else(|_| cache_dir(workspace))
+        .join("declined.jsonl")
 }
 
 fn sidecar_path(workspace: &Path) -> PathBuf {

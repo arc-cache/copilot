@@ -574,6 +574,8 @@ fn review_events_unlocked(
     let hash = trace_hash(events);
     let correction = correction_signal(events);
     let options = review_options_for_session(events, workspace, session_id)?;
+    let review_input = strong_review_input(&packet, intent)?;
+    let recurrence = recurrence_context(&review_input, workspace, session_id)?;
     debug(
         workspace,
         "review.queued",
@@ -586,7 +588,14 @@ fn review_events_unlocked(
             json!({ "sessionId": session_id, "injectedCapsuleIds": options.injected_capsule_ids }),
         )?;
     }
-    let review = review_packet(&packet, workspace, intent, &options)?;
+    let review = review_packet(
+        &packet,
+        &review_input,
+        workspace,
+        intent,
+        &options,
+        recurrence.as_ref(),
+    )?;
     let capsule_inputs = review_capsules(review.as_ref());
     let outcome_allowed_capsules = capsule_inputs
         .iter()
@@ -695,6 +704,9 @@ fn review_events_unlocked(
                     "outcomeStatus".to_owned(),
                     Value::String(packet.outcome.status.clone()),
                 );
+                if let Some(recurrence) = recurrence.as_ref() {
+                    add_recurrence_provenance(map, recurrence, session_id);
+                }
             }
             let capsule: Capsule = serde_json::from_value(capsule_value)?;
             if let Some(saved_capsule) = save_capsule(capsule, workspace)? {
@@ -730,6 +742,13 @@ fn review_events_unlocked(
                 Some(
                     json!({ "reason": reason, "outcome": packet.outcome.status, "eventCount": events.len() }),
                 ),
+            )?;
+            record_declined_draft(
+                workspace,
+                &review_input,
+                session_id,
+                &packet.outcome.status,
+                reason,
             )?;
             let result = ReviewOutcome {
                 status: "no_capsule".to_owned(),
@@ -827,6 +846,13 @@ fn review_events_unlocked(
             "correctionReasons": if correction.detected { Some(correction.reasons.clone()) } else { None }
         })),
     )?;
+    record_declined_draft(
+        workspace,
+        &review_input,
+        session_id,
+        &packet.outcome.status,
+        &reason,
+    )?;
     let result = ReviewOutcome {
         status: "no_capsule".to_owned(),
         reason: Some(reason),
@@ -845,11 +871,13 @@ fn review_events_unlocked(
 
 fn review_packet(
     packet: &EvidencePacket,
+    review_input: &Value,
     workspace: &Path,
     intent: &str,
     options: &ReviewOptions,
+    recurrence: Option<&ReviewRecurrence>,
 ) -> Result<Option<Value>> {
-    if intent == "auto" {
+    if intent == "auto" && recurrence.is_none() {
         if let Some(gated) = review_gate_from_observer(packet, workspace)? {
             return Ok(Some(gated));
         }
@@ -857,13 +885,12 @@ fn review_packet(
     let original_packet = serde_json::to_value(packet)?;
     let existing_capsules =
         review_candidate_capsules(&original_packet, workspace, &options.injected_capsule_ids)?;
-    let review_input = strong_review_input(packet, intent)?;
-    let review_context = review_context_from_options(options);
+    let review_context = review_context_from_options(options, recurrence);
     if let Ok(command) = env::var("AGENT_RUN_CACHE_REVIEWER_COMMAND") {
         if !command.trim().is_empty() {
             let command_input = review_context
                 .as_ref()
-                .map(|context| review_input_with_context(&review_input, context))
+                .map(|context| review_input_with_context(review_input, context))
                 .unwrap_or_else(|| review_input.clone());
             let input = serde_json::to_string(&command_input)?;
             let output = run_shell_command(&command, &input)?;
@@ -897,7 +924,7 @@ fn review_packet(
         )?;
         return Ok(Some(json!({ "shouldSave": false, "reason": reason })));
     };
-    let prompt = review_prompt(&review_input, &existing_capsules, review_context.as_ref());
+    let prompt = review_prompt(review_input, &existing_capsules, review_context.as_ref());
     let output = run_model_sidecar(&prompt, workspace, &runner)?;
     let parsed = extract_json_object(&output)?;
     record_sidecar_exchange(workspace, "review", &runner, &prompt, &output, &parsed)?;
@@ -917,7 +944,10 @@ fn review_input_with_context(review_input: &Value, review_context: &Value) -> Va
     next
 }
 
-fn review_context_from_options(options: &ReviewOptions) -> Option<Value> {
+fn review_context_from_options(
+    options: &ReviewOptions,
+    recurrence: Option<&ReviewRecurrence>,
+) -> Option<Value> {
     let mut map = Map::new();
     optional_insert(
         &mut map,
@@ -951,7 +981,26 @@ fn review_context_from_options(options: &ReviewOptions) -> Option<Value> {
             json!(options.judge_decision_ids),
         );
     }
+    if let Some(recurrence) = recurrence {
+        map.insert(
+            "recurrence".to_owned(),
+            json!({
+                "mergeKey": recurrence.merge_key,
+                "recurrenceCount": recurrence.count,
+                "priorDeclineReason": recurrence.prior_reason,
+                "priorSessionIds": recurrence.prior_session_ids
+            }),
+        );
+    }
     (!map.is_empty()).then_some(Value::Object(map))
+}
+
+#[derive(Debug, Clone)]
+struct ReviewRecurrence {
+    merge_key: String,
+    count: usize,
+    prior_reason: String,
+    prior_session_ids: Vec<String>,
 }
 
 fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
@@ -977,6 +1026,7 @@ fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
         "workspace": packet.workspace,
         "createdAt": now_iso(),
         "goalId": &sha256_hex(&goal_hash_parts.join("\n"))[..12],
+        "mergeKey": draft_merge_key(packet),
         "span": {
             "startEventId": source_event_ids.first(),
             "endEventId": source_event_ids.last(),
@@ -1000,22 +1050,93 @@ fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
     }))
 }
 
+fn draft_merge_key(packet: &EvidencePacket) -> String {
+    let source = if packet.commands.iter().any(|value| !value.trim().is_empty()) {
+        packet
+            .commands
+            .iter()
+            .rev()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        packet
+            .prompts
+            .iter()
+            .rev()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let normalized = source
+        .into_iter()
+        .rev()
+        .map(|value| {
+            let portable = portable_snippet_text(&redact_sensitive(&value), &packet.workspace);
+            portable
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("draft:{}", &sha256_hex(&normalized)[..20])
+    }
+}
+
+fn recurrence_context(
+    review_input: &Value,
+    workspace: &Path,
+    session_id: &str,
+) -> Result<Option<ReviewRecurrence>> {
+    let merge_key = review_input
+        .get("mergeKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if merge_key.is_empty() {
+        return Ok(None);
+    }
+    let mut prior_session_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut prior_reason = String::new();
+    for value in read_jsonl_values(&declined_path(workspace))? {
+        let Ok(record) = serde_json::from_value::<DeclinedDraftRecord>(value) else {
+            continue;
+        };
+        if record.merge_key != merge_key
+            || record.session_id == session_id
+            || !seen.insert(record.session_id.clone())
+        {
+            continue;
+        }
+        prior_reason = record.reason;
+        prior_session_ids.push(record.session_id);
+    }
+    if prior_session_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ReviewRecurrence {
+        merge_key: merge_key.to_owned(),
+        count: prior_session_ids.len() + 1,
+        prior_reason,
+        prior_session_ids,
+    }))
+}
+
 fn review_prompt(
     packet: &Value,
     existing_capsules: &[Capsule],
     review_context: Option<&Value>,
 ) -> String {
     if packet.get("packetKind").and_then(Value::as_str) == Some("assembled_draft") {
-        return assembled_draft_review_prompt(packet, existing_capsules);
+        return assembled_draft_review_prompt(packet, existing_capsules, review_context);
     }
-    let context_block = review_context
-        .map(|context| {
-            format!(
-                "\nARC review context from pre-turn retrieval:\n{}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n",
-                truncate(&serde_json::to_string(context).unwrap_or_default(), 2000)
-            )
-        })
-        .unwrap_or_default();
+    let context_block = review_context_prompt_block(review_context);
     format!(
         r#"You are the Agent Run Cache sidecar.
 
@@ -1115,7 +1236,37 @@ Evidence packet:
     )
 }
 
-fn assembled_draft_review_prompt(packet: &Value, existing_capsules: &[Capsule]) -> String {
+fn review_context_prompt_block(review_context: Option<&Value>) -> String {
+    let Some(context) = review_context else {
+        return String::new();
+    };
+    let mut block = format!(
+        "\nARC review context from pre-turn retrieval:\n{}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n",
+        truncate(&serde_json::to_string(context).unwrap_or_default(), 2000)
+    );
+    if let Some(recurrence) = context.get("recurrence") {
+        let count = recurrence
+            .get("recurrenceCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let reason = recurrence
+            .get("priorDeclineReason")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason recorded");
+        block.push_str(&format!(
+            "This method has been observed {count} times across sessions (previously declined: {}). Recurrence is evidence of reusability; prefer saving with provenance noting both sessions. You still own the save or decline decision.\n",
+            truncate(reason, 500)
+        ));
+    }
+    block
+}
+
+fn assembled_draft_review_prompt(
+    packet: &Value,
+    existing_capsules: &[Capsule],
+    review_context: Option<&Value>,
+) -> String {
+    let context_block = review_context_prompt_block(review_context);
     format!(
         r#"You are the Agent Run Cache sidecar.
 
@@ -1138,7 +1289,7 @@ Rules:
 - Do not copy secrets. If a command contains credentials, describe the parameter instead.
 - Do not copy private IPs, MAC addresses, token values, personal home paths, or full remote URLs. Use stable placeholders such as <private-ip>, <mac-address>, <token>, <home>, and <url>.
 - If nothing durable was learned, return {{"shouldSave": false, "reason": "..."}}.
-{}
+{}{}
 
 Return the same JSON shape as normal ARC reviews:
 {{
@@ -1179,6 +1330,7 @@ Return the same JSON shape as normal ARC reviews:
 Assembled draft:
 {}"#,
         existing_capsule_context(existing_capsules),
+        context_block,
         truncate(&serde_json::to_string(packet).unwrap_or_default(), 40000)
     )
 }
@@ -2686,6 +2838,68 @@ fn record_review(workspace: &Path, record: ReviewRecord) -> Result<()> {
     append_jsonl(&reviewed_path(workspace), &record)
 }
 
+fn record_declined_draft(
+    workspace: &Path,
+    review_input: &Value,
+    session_id: &str,
+    outcome: &str,
+    reason: &str,
+) -> Result<()> {
+    let merge_key = review_input
+        .get("mergeKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if merge_key.is_empty() {
+        return Ok(());
+    }
+    let record = DeclinedDraftRecord {
+        id: format!(
+            "declined-{}",
+            &sha256_hex(&format!("{session_id}\n{merge_key}"))[..16]
+        ),
+        merge_key: merge_key.to_owned(),
+        created_at: now_iso(),
+        session_id: session_id.to_owned(),
+        outcome: outcome.to_owned(),
+        reason: reason.to_owned(),
+    };
+    append_jsonl(&declined_path(workspace), &record)
+}
+
+fn add_recurrence_provenance(
+    capsule: &mut Map<String, Value>,
+    recurrence: &ReviewRecurrence,
+    session_id: &str,
+) {
+    let provenance = capsule
+        .entry("provenance".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(values) = provenance {
+        values.push(Value::String(format!(
+            "recurrenceCount: {}",
+            recurrence.count
+        )));
+    }
+    let source_session_ids = capsule
+        .entry("sourceSessionIds".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(values) = source_session_ids {
+        for source_session_id in recurrence
+            .prior_session_ids
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(session_id))
+        {
+            if !values
+                .iter()
+                .any(|value| value.as_str() == Some(source_session_id))
+            {
+                values.push(Value::String(source_session_id.to_owned()));
+            }
+        }
+    }
+}
+
 pub(crate) fn record_sidecar_exchange(
     workspace: &Path,
     kind: &str,
@@ -3382,5 +3596,76 @@ mod split_harvest_tests {
         assert!(evidence.contains("exit code 0"), "{evidence}");
         assert!(evidence.contains("BUILD_OUTPUT_CONFIRMED"), "{evidence}");
         assert!(evidence.contains("run-build --check"), "{evidence}");
+    }
+
+    #[test]
+    fn second_review_with_same_merge_key_gets_recurrence_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let packet = |session_id: &str| EvidencePacket {
+            runner: "copilot".to_owned(),
+            session_id: session_id.to_owned(),
+            workspace: workspace.to_string_lossy().to_string(),
+            created_at: now_iso(),
+            episodes: Vec::new(),
+            prompts: vec!["verify the package".to_owned()],
+            assistant_messages: Vec::new(),
+            tool_events: Vec::new(),
+            commands: vec!["package-check --target sample".to_owned()],
+            paths: Vec::new(),
+            event_count: 2,
+            outcome: EvidenceOutcome {
+                status: "success".to_owned(),
+                confidence: 1.0,
+                reasons: Vec::new(),
+                success_signals: Vec::new(),
+                failure_signals: Vec::new(),
+                aborted_signals: Vec::new(),
+            },
+        };
+        let first = strong_review_input(&packet("session-one"), "auto").unwrap();
+        let second = strong_review_input(&packet("session-two"), "auto").unwrap();
+        assert_eq!(first.get("mergeKey"), second.get("mergeKey"));
+        record_declined_draft(
+            &workspace,
+            &first,
+            "session-one",
+            "success",
+            "looked one-off",
+        )
+        .unwrap();
+
+        let recurrence = recurrence_context(&second, &workspace, "session-two")
+            .unwrap()
+            .unwrap();
+        let context =
+            review_context_from_options(&ReviewOptions::default(), Some(&recurrence)).unwrap();
+        let prompt = review_prompt(&second, &[], Some(&context));
+
+        assert_eq!(recurrence.count, 2);
+        assert!(
+            prompt.contains("observed 2 times across sessions"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("previously declined: looked one-off"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Recurrence is evidence of reusability"),
+            "{prompt}"
+        );
+
+        let mut capsule = Map::new();
+        add_recurrence_provenance(&mut capsule, &recurrence, "session-two");
+        assert_eq!(
+            capsule
+                .get("provenance")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str),
+            Some("recurrenceCount: 2")
+        );
     }
 }
