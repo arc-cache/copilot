@@ -5,6 +5,7 @@ import { isAbsolute, relative, resolve } from "node:path";
 import { appendJsonl, extractJsonObject } from "./json.js";
 import { copilotSidecarCommand } from "./copilot-command.js";
 import { cleanupSidecarCopilotSessions, listCopilotSessionIds } from "./copilot-sessions.js";
+import { reviewRecurrence } from "./declined.js";
 import { sidecarPath } from "./paths.js";
 import { redactJson, redactSensitiveText } from "./redact.js";
 import { debug, loadCapsules } from "./store.js";
@@ -35,15 +36,20 @@ export async function reviewPacket(
   intent: ReviewIntent = "auto",
   options: SidecarReviewOptions = {}
 ): Promise<SidecarReview | null> {
+  const reviewInput = strongReviewInput(packet, intent);
+  const recurrence = options.recurrence ?? await reviewRecurrence(
+    isAssembledDraft(reviewInput) ? reviewInput.mergeKey : draftMergeKeyFromEvidence(packet as EvidencePacket),
+    packet.sessionId,
+    workspace
+  );
   // A user-requested save is an explicit decision; the observer gate only
   // filters reviews ARC initiates on its own.
-  if (intent === "auto") {
+  if (intent === "auto" && !recurrence) {
     const gated = await reviewGateFromObserver(packet, workspace);
     if (gated) return gated;
   }
   const existingCapsules = await reviewCandidateCapsules(packet, workspace, options);
-  const reviewInput = strongReviewInput(packet, intent);
-  const reviewContext = reviewContextFromOptions(options);
+  const reviewContext = reviewContextFromOptions({ ...options, recurrence });
   const command = process.env.AGENT_RUN_CACHE_REVIEWER_COMMAND;
   if (command) {
     const input = JSON.stringify(reviewContext ? { ...reviewInput, reviewContext } : reviewInput);
@@ -89,7 +95,7 @@ export async function reviewPacket(
   return parsed;
 }
 
-type ReviewContext = Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds">;
+type ReviewContext = Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds" | "recurrence">;
 
 function reviewContextFromOptions(options: SidecarReviewOptions): ReviewContext | undefined {
   const context: ReviewContext = {
@@ -98,7 +104,8 @@ function reviewContextFromOptions(options: SidecarReviewOptions): ReviewContext 
     consultAbstainReason: options.consultAbstainReason,
     actionRisk: options.actionRisk,
     injectedCapsuleIds: options.injectedCapsuleIds,
-    judgeDecisionIds: options.judgeDecisionIds
+    judgeDecisionIds: options.judgeDecisionIds,
+    recurrence: options.recurrence
   };
   return Object.values(context).some((value) => value !== undefined) ? context : undefined;
 }
@@ -529,10 +536,8 @@ Candidate rules:
 }
 
 function reviewPrompt(packet: ReviewPacket, existingCapsules: Capsule[] = [], reviewContext?: ReviewContext): string {
-  if (isAssembledDraft(packet)) return assembledDraftReviewPrompt(packet, existingCapsules);
-  const contextBlock = reviewContext
-    ? `\nARC review context from pre-turn retrieval:\n${JSON.stringify(reviewContext).slice(0, 2000)}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n`
-    : "";
+  if (isAssembledDraft(packet)) return assembledDraftReviewPrompt(packet, existingCapsules, reviewContext);
+  const contextBlock = reviewContextPromptBlock(reviewContext);
   return `You are the Agent Run Cache sidecar.
 
 Your job is to decide whether a completed coding-agent session produced one or more reusable workflow capsules.
@@ -540,7 +545,8 @@ Return JSON only. Do not include Markdown.
 
 Rules:
 - Save only if the session shows a reusable method, route, script, command sequence, resolver, or project fact that would help a future similar session.
-- Use packet.outcome. A failed or aborted session must not become a positive workflow. For failed sessions, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted session must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -628,7 +634,20 @@ Evidence packet:
 ${JSON.stringify(packet).slice(0, 60000)}`;
 }
 
-function assembledDraftReviewPrompt(packet: AssembledDraft, existingCapsules: Capsule[] = []): string {
+function reviewContextPromptBlock(reviewContext?: ReviewContext): string {
+  if (!reviewContext) return "";
+  let block = `\nARC review context from pre-turn retrieval:\n${JSON.stringify(reviewContext).slice(0, 2000)}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n`;
+  if (reviewContext.recurrence) {
+    block += `This method has been observed ${reviewContext.recurrence.recurrenceCount} times across sessions (previously declined: ${reviewContext.recurrence.priorDeclineReason.slice(0, 500)}). Recurrence is evidence of reusability; prefer saving with provenance noting both sessions. You still own the save or decline decision.\n`;
+  }
+  return block;
+}
+
+function assembledDraftReviewPrompt(
+  packet: AssembledDraft,
+  existingCapsules: Capsule[] = [],
+  reviewContext?: ReviewContext
+): string {
   return `You are the Agent Run Cache sidecar.
 
 ARC's local loop assembled this draft at a goal boundary. The draft is not a capsule and it is not authoritative prose; it is a compact evidence object made from typed events and local observations.
@@ -640,7 +659,8 @@ Rules:
 - Save only if the draft shows a reusable method, route, command shape, resolver, project fact, caution, or dead end that would help a future similar session.
 - The local loop is not allowed to author capsules. You own the durable save/decline and capsule prose.
 - Treat commands as verbatim observed commands. Do not invent commands, paths, tools, or validation that are not present in the draft.
-- Use packet.outcome. A failed or aborted goal must not become a positive workflow. For failed goals, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted goal must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -651,6 +671,7 @@ Rules:
 - Do not copy private IPs, MAC addresses, token values, personal home paths, or full remote URLs. Use stable placeholders such as <private-ip>, <mac-address>, <token>, <home>, and <url>.
 - If nothing durable was learned, return {"shouldSave": false, "reason": "..."}.
 ${existingCapsuleContext(existingCapsules)}
+${reviewContextPromptBlock(reviewContext)}
 
 Return the same JSON shape as normal ARC reviews:
 {
@@ -830,7 +851,7 @@ function strongReviewInput(packet: ReviewPacket, intent: ReviewIntent): ReviewPa
   return assembledDraftFromEvidence(packet);
 }
 
-function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
+export function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
   const sourceEventIds = packet.toolEvents.map((event) => event.id);
   return {
     packetKind: "assembled_draft",
@@ -839,6 +860,7 @@ function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
     workspace: packet.workspace,
     createdAt: new Date().toISOString(),
     goalId: sha256([packet.sessionId, packet.eventCount, ...sourceEventIds].join("\n")).slice(0, 12),
+    mergeKey: draftMergeKeyFromEvidence(packet),
     span: {
       startEventId: sourceEventIds[0],
       endEventId: sourceEventIds.at(-1),
@@ -856,20 +878,117 @@ function assembledDraftFromEvidence(packet: EvidencePacket): AssembledDraft {
   };
 }
 
-function evidenceSnippetsFromPacket(packet: EvidencePacket): string[] {
-  const snippets = [
-    ...packet.toolEvents
-      .filter((event) => event.type === "tool_end")
-      .map((event) => snippetFromToolEnd(event, packet.workspace))
-      .filter(Boolean),
-    ...packet.assistantMessages.slice(-3).map((message) => cleanSnippet(`assistant: ${message}`, 700, packet.workspace)).filter(Boolean)
-  ];
-  return boundEvidenceSnippets(unique(snippets).slice(-12));
+export function draftMergeKeyFromEvidence(packet: EvidencePacket): string {
+  const source = packet.commands.some((value) => value.trim())
+    ? packet.commands.slice(-6)
+    : packet.prompts.slice(-3);
+  const normalized = source
+    .map((value) => portableSnippetText(redactSensitiveText(value), packet.workspace)
+      .split(/\s+/)
+      .filter(Boolean)
+      .join(" ")
+      .toLowerCase())
+    .filter(Boolean)
+    .join("\n");
+  return normalized ? `draft:${sha256(normalized).slice(0, 20)}` : "";
 }
 
-function snippetFromToolEnd(event: EvidencePacket["toolEvents"][number], workspace: string): string {
+function evidenceSnippetsFromPacket(packet: EvidencePacket): string[] {
+  const startsById = new Map(
+    packet.toolEvents
+      .filter((event) => event.type === "tool_start")
+      .map((event) => [toolEventId(event), event] as const)
+      .filter((entry): entry is [string, EvidencePacket["toolEvents"][number]] => Boolean(entry[0]))
+  );
+  const completedIds = new Set(
+    packet.toolEvents
+      .filter((event) => event.type === "tool_end")
+      .map(toolEventId)
+      .filter((id): id is string => Boolean(id))
+  );
+  const completedCommandEvents = packet.toolEvents
+    .filter((event) => event.type === "tool_end")
+    .map((event) => ({ event, start: startsById.get(toolEventId(event) ?? "") }))
+    .filter(({ event, start }) => event.exitCode !== undefined || Boolean(event.command ?? start?.command));
+  const commandEventIds = new Set(
+    completedCommandEvents.map(({ event }) => toolEventId(event)).filter((id): id is string => Boolean(id))
+  );
+  const completedCommands = completedCommandEvents
+    .map(({ event, start }) => snippetFromCommandResult(event, start, packet.workspace));
+  const failedResults = packet.toolEvents
+    .filter((event) => event.type === "tool_end" && toolEventFailed(event))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !commandEventIds.has(id);
+    })
+    .map((event) => snippetFromToolEnd(event, packet.workspace, 700, true))
+    .filter(Boolean);
+  const incompleteCommands = packet.toolEvents
+    .filter((event) => event.type === "tool_start" && Boolean(event.command))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !completedIds.has(id);
+    })
+    .map((event) => snippetFromIncompleteCommand(event, packet.workspace))
+    .filter(Boolean);
+  const genericResults = packet.toolEvents
+    .filter((event) => event.type === "tool_end" && !toolEventFailed(event))
+    .filter((event) => {
+      const id = toolEventId(event);
+      return !id || !commandEventIds.has(id);
+    })
+    .map((event) => snippetFromToolEnd(event, packet.workspace, 350, false))
+    .filter(Boolean);
+  return boundEvidenceSnippets(unique([
+    ...completedCommands.slice(-4),
+    ...failedResults.slice(-3),
+    ...incompleteCommands.slice(-2),
+    ...genericResults.slice(-4),
+    ...packet.assistantMessages.filter((message) => message.trim()).slice(-2).map((message) => cleanSnippet(`assistant: ${message}`, 400, packet.workspace)).filter(Boolean)
+  ]));
+}
+
+function toolEventId(event: EvidencePacket["toolEvents"][number]): string | undefined {
+  if (event.toolUseId) return event.toolUseId;
+  if (!event.raw || typeof event.raw !== "object") return undefined;
+  const data = (event.raw as { data?: unknown }).data;
+  if (!data || typeof data !== "object") return undefined;
+  const toolCallId = (data as { toolCallId?: unknown }).toolCallId;
+  return typeof toolCallId === "string" ? toolCallId : undefined;
+}
+
+function toolEventFailed(event: EvidencePacket["toolEvents"][number]): boolean {
+  return event.toolStatus === "failed" || (event.exitCode !== undefined && event.exitCode !== 0);
+}
+
+function snippetFromCommandResult(
+  event: EvidencePacket["toolEvents"][number],
+  start: EvidencePacket["toolEvents"][number] | undefined,
+  workspace: string
+): string {
+  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode !== undefined ? "failed" : "unknown");
+  const result = event.exitCode !== undefined ? `exit code ${event.exitCode}` : `status ${status}`;
+  const command = cleanSnippet(event.command ?? start?.command ?? event.toolName ?? "command", 260, workspace);
+  const output = event.text ? `\noutput tail:\n${cleanTailSnippet(event.text, 420, workspace)}` : "";
+  return cleanSnippet(`${status} command result (${result}): ${command}${output}`, 700, workspace);
+}
+
+function snippetFromIncompleteCommand(event: EvidencePacket["toolEvents"][number], workspace: string): string {
+  return cleanSnippet(
+    `incomplete command (no completion event observed): ${cleanSnippet(event.command ?? "", 340, workspace)}`,
+    400,
+    workspace
+  );
+}
+
+function snippetFromToolEnd(
+  event: EvidencePacket["toolEvents"][number],
+  workspace: string,
+  maxLength: number,
+  useTail: boolean
+): string {
   const label = event.toolName ?? "tool";
-  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode ? "failed" : "unknown");
+  const status = event.toolStatus ?? (event.exitCode === 0 ? "success" : event.exitCode !== undefined ? "failed" : "unknown");
   if (event.rawType === "fileChange") {
     const changes = fileChangeSummaries(event.raw, workspace);
     if (changes.length) {
@@ -877,8 +996,10 @@ function snippetFromToolEnd(event: EvidencePacket["toolEvents"][number], workspa
     }
   }
   const command = event.command ? portableSnippetText(`${event.command}`, workspace) : label;
-  const text = event.text ? `\n${event.text}` : "";
-  return cleanSnippet(`${status} ${label}: ${command}${text}`, 900, workspace);
+  const text = event.text
+    ? `\n${useTail ? cleanTailSnippet(event.text, Math.max(0, maxLength - 100), workspace) : cleanSnippet(event.text, Math.max(0, maxLength - 100), workspace)}`
+    : "";
+  return cleanSnippet(`${status} ${label}: ${command}${text}`, maxLength, workspace);
 }
 
 function fileChangeSummaries(raw: unknown, workspace: string): string[] {
@@ -915,6 +1036,15 @@ function cleanSnippet(value: string, maxLength: number, workspace: string): stri
     .trim();
   if (compact.length <= maxLength) return compact;
   return `${compact.slice(0, Math.max(0, maxLength - 3)).trimEnd()}...`;
+}
+
+function cleanTailSnippet(value: string, maxLength: number, workspace: string): string {
+  const compact = redactSensitiveText(portableSnippetText(value, workspace))
+    .replace(/\r/g, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+  if (compact.length <= maxLength) return compact;
+  return `...${compact.slice(-Math.max(0, maxLength - 3)).trimStart()}`;
 }
 
 function portableSnippetText(value: string, workspace: string): string {

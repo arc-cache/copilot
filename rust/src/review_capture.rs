@@ -423,6 +423,7 @@ fn normalize_copilot_record(
             tool_name
         });
         event.tool_use_id = text_value(data.get("toolUseId"))
+            .or_else(|| text_value(data.get("toolCallId")))
             .or_else(|| text_value(data.get("id")))
             .or_else(|| text_value(data.get("callId")))
             .filter(|value| !value.is_empty());
@@ -573,6 +574,8 @@ fn review_events_unlocked(
     let hash = trace_hash(events);
     let correction = correction_signal(events);
     let options = review_options_for_session(events, workspace, session_id)?;
+    let review_input = strong_review_input(&packet, intent)?;
+    let recurrence = recurrence_context(&review_input, workspace, session_id)?;
     debug(
         workspace,
         "review.queued",
@@ -585,7 +588,14 @@ fn review_events_unlocked(
             json!({ "sessionId": session_id, "injectedCapsuleIds": options.injected_capsule_ids }),
         )?;
     }
-    let review = review_packet(&packet, workspace, intent, &options)?;
+    let review = review_packet(
+        &packet,
+        &review_input,
+        workspace,
+        intent,
+        &options,
+        recurrence.as_ref(),
+    )?;
     let capsule_inputs = review_capsules(review.as_ref());
     let outcome_allowed_capsules = capsule_inputs
         .iter()
@@ -694,6 +704,9 @@ fn review_events_unlocked(
                     "outcomeStatus".to_owned(),
                     Value::String(packet.outcome.status.clone()),
                 );
+                if let Some(recurrence) = recurrence.as_ref() {
+                    add_recurrence_provenance(map, recurrence, session_id);
+                }
             }
             let capsule: Capsule = serde_json::from_value(capsule_value)?;
             if let Some(saved_capsule) = save_capsule(capsule, workspace)? {
@@ -729,6 +742,13 @@ fn review_events_unlocked(
                 Some(
                     json!({ "reason": reason, "outcome": packet.outcome.status, "eventCount": events.len() }),
                 ),
+            )?;
+            record_declined_draft(
+                workspace,
+                &review_input,
+                session_id,
+                &packet.outcome.status,
+                reason,
             )?;
             let result = ReviewOutcome {
                 status: "no_capsule".to_owned(),
@@ -826,6 +846,13 @@ fn review_events_unlocked(
             "correctionReasons": if correction.detected { Some(correction.reasons.clone()) } else { None }
         })),
     )?;
+    record_declined_draft(
+        workspace,
+        &review_input,
+        session_id,
+        &packet.outcome.status,
+        &reason,
+    )?;
     let result = ReviewOutcome {
         status: "no_capsule".to_owned(),
         reason: Some(reason),
@@ -844,11 +871,13 @@ fn review_events_unlocked(
 
 fn review_packet(
     packet: &EvidencePacket,
+    review_input: &Value,
     workspace: &Path,
     intent: &str,
     options: &ReviewOptions,
+    recurrence: Option<&ReviewRecurrence>,
 ) -> Result<Option<Value>> {
-    if intent == "auto" {
+    if intent == "auto" && recurrence.is_none() {
         if let Some(gated) = review_gate_from_observer(packet, workspace)? {
             return Ok(Some(gated));
         }
@@ -856,13 +885,12 @@ fn review_packet(
     let original_packet = serde_json::to_value(packet)?;
     let existing_capsules =
         review_candidate_capsules(&original_packet, workspace, &options.injected_capsule_ids)?;
-    let review_input = strong_review_input(packet, intent)?;
-    let review_context = review_context_from_options(options);
+    let review_context = review_context_from_options(options, recurrence);
     if let Ok(command) = env::var("AGENT_RUN_CACHE_REVIEWER_COMMAND") {
         if !command.trim().is_empty() {
             let command_input = review_context
                 .as_ref()
-                .map(|context| review_input_with_context(&review_input, context))
+                .map(|context| review_input_with_context(review_input, context))
                 .unwrap_or_else(|| review_input.clone());
             let input = serde_json::to_string(&command_input)?;
             let output = run_shell_command(&command, &input)?;
@@ -896,7 +924,7 @@ fn review_packet(
         )?;
         return Ok(Some(json!({ "shouldSave": false, "reason": reason })));
     };
-    let prompt = review_prompt(&review_input, &existing_capsules, review_context.as_ref());
+    let prompt = review_prompt(review_input, &existing_capsules, review_context.as_ref());
     let output = run_model_sidecar(&prompt, workspace, &runner)?;
     let parsed = extract_json_object(&output)?;
     record_sidecar_exchange(workspace, "review", &runner, &prompt, &output, &parsed)?;
@@ -916,7 +944,10 @@ fn review_input_with_context(review_input: &Value, review_context: &Value) -> Va
     next
 }
 
-fn review_context_from_options(options: &ReviewOptions) -> Option<Value> {
+fn review_context_from_options(
+    options: &ReviewOptions,
+    recurrence: Option<&ReviewRecurrence>,
+) -> Option<Value> {
     let mut map = Map::new();
     optional_insert(
         &mut map,
@@ -950,7 +981,26 @@ fn review_context_from_options(options: &ReviewOptions) -> Option<Value> {
             json!(options.judge_decision_ids),
         );
     }
+    if let Some(recurrence) = recurrence {
+        map.insert(
+            "recurrence".to_owned(),
+            json!({
+                "mergeKey": recurrence.merge_key,
+                "recurrenceCount": recurrence.count,
+                "priorDeclineReason": recurrence.prior_reason,
+                "priorSessionIds": recurrence.prior_session_ids
+            }),
+        );
+    }
     (!map.is_empty()).then_some(Value::Object(map))
+}
+
+#[derive(Debug, Clone)]
+struct ReviewRecurrence {
+    merge_key: String,
+    count: usize,
+    prior_reason: String,
+    prior_session_ids: Vec<String>,
 }
 
 fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
@@ -976,6 +1026,7 @@ fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
         "workspace": packet.workspace,
         "createdAt": now_iso(),
         "goalId": &sha256_hex(&goal_hash_parts.join("\n"))[..12],
+        "mergeKey": draft_merge_key(packet),
         "span": {
             "startEventId": source_event_ids.first(),
             "endEventId": source_event_ids.last(),
@@ -999,22 +1050,90 @@ fn strong_review_input(packet: &EvidencePacket, intent: &str) -> Result<Value> {
     }))
 }
 
+fn draft_merge_key(packet: &EvidencePacket) -> String {
+    let source = if packet.commands.iter().any(|value| !value.trim().is_empty()) {
+        packet
+            .commands
+            .iter()
+            .rev()
+            .take(6)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        packet
+            .prompts
+            .iter()
+            .rev()
+            .take(3)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let normalized = source
+        .into_iter()
+        .rev()
+        .map(|value| {
+            let portable = portable_snippet_text(&redact_sensitive(&value), &packet.workspace);
+            portable
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase()
+        })
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if normalized.is_empty() {
+        String::new()
+    } else {
+        format!("draft:{}", &sha256_hex(&normalized)[..20])
+    }
+}
+
+fn recurrence_context(
+    review_input: &Value,
+    workspace: &Path,
+    session_id: &str,
+) -> Result<Option<ReviewRecurrence>> {
+    let merge_key = review_input
+        .get("mergeKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if merge_key.is_empty() {
+        return Ok(None);
+    }
+    let mut prior_session_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let mut prior_reason = String::new();
+    for record in load_retained_declined_drafts(workspace)? {
+        if record.merge_key != merge_key
+            || record.session_id == session_id
+            || !seen.insert(record.session_id.clone())
+        {
+            continue;
+        }
+        prior_reason = record.reason;
+        prior_session_ids.push(record.session_id);
+    }
+    if prior_session_ids.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(ReviewRecurrence {
+        merge_key: merge_key.to_owned(),
+        count: prior_session_ids.len() + 1,
+        prior_reason,
+        prior_session_ids,
+    }))
+}
+
 fn review_prompt(
     packet: &Value,
     existing_capsules: &[Capsule],
     review_context: Option<&Value>,
 ) -> String {
     if packet.get("packetKind").and_then(Value::as_str) == Some("assembled_draft") {
-        return assembled_draft_review_prompt(packet, existing_capsules);
+        return assembled_draft_review_prompt(packet, existing_capsules, review_context);
     }
-    let context_block = review_context
-        .map(|context| {
-            format!(
-                "\nARC review context from pre-turn retrieval:\n{}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n",
-                truncate(&serde_json::to_string(context).unwrap_or_default(), 2000)
-            )
-        })
-        .unwrap_or_default();
+    let context_block = review_context_prompt_block(review_context);
     format!(
         r#"You are the Agent Run Cache sidecar.
 
@@ -1023,7 +1142,8 @@ Return JSON only. Do not include Markdown.
 
 Rules:
 - Save only if the session shows a reusable method, route, script, command sequence, resolver, or project fact that would help a future similar session.
-- Use packet.outcome. A failed or aborted session must not become a positive workflow. For failed sessions, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted session must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -1114,7 +1234,37 @@ Evidence packet:
     )
 }
 
-fn assembled_draft_review_prompt(packet: &Value, existing_capsules: &[Capsule]) -> String {
+fn review_context_prompt_block(review_context: Option<&Value>) -> String {
+    let Some(context) = review_context else {
+        return String::new();
+    };
+    let mut block = format!(
+        "\nARC review context from pre-turn retrieval:\n{}\nIf actionRisk is present, do not save a broad live-action capsule from this turn. Save only a narrow interpretation, caution, or project fact unless the trace also shows explicit live-action intent and successful validation.\n",
+        truncate(&serde_json::to_string(context).unwrap_or_default(), 2000)
+    );
+    if let Some(recurrence) = context.get("recurrence") {
+        let count = recurrence
+            .get("recurrenceCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(1);
+        let reason = recurrence
+            .get("priorDeclineReason")
+            .and_then(Value::as_str)
+            .unwrap_or("no reason recorded");
+        block.push_str(&format!(
+            "This method has been observed {count} times across sessions (previously declined: {}). Recurrence is evidence of reusability; prefer saving with provenance noting both sessions. You still own the save or decline decision.\n",
+            truncate(reason, 500)
+        ));
+    }
+    block
+}
+
+fn assembled_draft_review_prompt(
+    packet: &Value,
+    existing_capsules: &[Capsule],
+    review_context: Option<&Value>,
+) -> String {
+    let context_block = review_context_prompt_block(review_context);
     format!(
         r#"You are the Agent Run Cache sidecar.
 
@@ -1127,7 +1277,8 @@ Rules:
 - Save only if the draft shows a reusable method, route, command shape, resolver, project fact, caution, or dead end that would help a future similar session.
 - The local loop is not allowed to author capsules. You own the durable save/decline and capsule prose.
 - Treat commands as verbatim observed commands. Do not invent commands, paths, tools, or validation that are not present in the draft.
-- Use packet.outcome. A failed or aborted goal must not become a positive workflow. For failed goals, save only project facts, cautions, or dead ends unless the evidence clearly shows a later verified successful recovery.
+- Use packet.outcome. A partial, failed, or aborted goal must not become a positive workflow. For these outcomes, save only project facts, cautions, or dead ends.
+- For partial, failed, or aborted work, prefer salvaging a concrete caution, dead end, or project fact when the evidence supports one. Decline only when nothing in the evidence could help a future similar session.
 - Never cite a failed tool/read as positive evidence, provenance, reusable command, validation proof, or successful binding source. Failed reads belong in failureBoundary or workflow.failedAttempts, unless the capsule is explicitly about the missing/failed artifact.
 - The capsule must stand alone. If the user supplied a markdown/runbook/script file, treat that file as provenance; infer the reusable method so a teammate without the file can still benefit.
 - Provide a stable mergeKey for the reusable method. The same method with different targets, files, branches, or commands should reuse the same mergeKey when the workflow shape is the same.
@@ -1137,7 +1288,7 @@ Rules:
 - Do not copy secrets. If a command contains credentials, describe the parameter instead.
 - Do not copy private IPs, MAC addresses, token values, personal home paths, or full remote URLs. Use stable placeholders such as <private-ip>, <mac-address>, <token>, <home>, and <url>.
 - If nothing durable was learned, return {{"shouldSave": false, "reason": "..."}}.
-{}
+{}{}
 
 Return the same JSON shape as normal ARC reviews:
 {{
@@ -1178,6 +1329,7 @@ Return the same JSON shape as normal ARC reviews:
 Assembled draft:
 {}"#,
         existing_capsule_context(existing_capsules),
+        context_block,
         truncate(&serde_json::to_string(packet).unwrap_or_default(), 40000)
     )
 }
@@ -2207,34 +2359,172 @@ fn looks_like_path(value: &str) -> bool {
 }
 
 fn evidence_snippets_from_packet(packet: &EvidencePacket) -> Vec<String> {
-    let mut snippets = packet
+    let starts_by_id = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_start")
+        .filter_map(|event| tool_event_id(event).map(|id| (id, event)))
+        .collect::<HashMap<_, _>>();
+    let completed_ids = packet
         .tool_events
         .iter()
         .filter(|event| event.type_ == "tool_end")
-        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace))
+        .filter_map(tool_event_id)
+        .collect::<HashSet<_>>();
+    let completed_commands = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end")
+        .filter_map(|event| {
+            let start = tool_event_id(event).and_then(|id| starts_by_id.get(&id).copied());
+            (event.exit_code.is_some()
+                || event.command.is_some()
+                || start.is_some_and(|value| value.command.is_some()))
+            .then(|| snippet_from_command_result(event, start, &packet.workspace))
+        })
         .collect::<Vec<_>>();
+    let command_event_ids = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end")
+        .filter_map(|event| {
+            let id = tool_event_id(event)?;
+            let start = starts_by_id.get(&id).copied();
+            (event.exit_code.is_some()
+                || event.command.is_some()
+                || start.is_some_and(|value| value.command.is_some()))
+            .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    let failed_results = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end" && tool_event_failed(event))
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !command_event_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace, 700, true))
+        .collect::<Vec<_>>();
+    let incomplete_commands = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_start" && event.command.is_some())
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !completed_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_incomplete_command(event, &packet.workspace))
+        .collect::<Vec<_>>();
+    let generic_results = packet
+        .tool_events
+        .iter()
+        .filter(|event| event.type_ == "tool_end" && !tool_event_failed(event))
+        .filter(|event| {
+            tool_event_id(event)
+                .map(|id| !command_event_ids.contains(&id))
+                .unwrap_or(true)
+        })
+        .filter_map(|event| snippet_from_tool_end(event, &packet.workspace, 350, false))
+        .collect::<Vec<_>>();
+
+    let mut snippets = Vec::new();
+    snippets.extend(tail_items(completed_commands, 4));
+    snippets.extend(tail_items(failed_results, 3));
+    snippets.extend(tail_items(incomplete_commands, 2));
+    snippets.extend(tail_items(generic_results, 4));
     snippets.extend(
         packet
             .assistant_messages
             .iter()
             .rev()
-            .take(3)
-            .map(|message| clean_snippet(&format!("assistant: {message}"), 700, &packet.workspace))
+            .filter(|message| !message.trim().is_empty())
+            .take(2)
+            .map(|message| clean_snippet(&format!("assistant: {message}"), 400, &packet.workspace))
             .filter(|value| !value.is_empty()),
     );
-    bound_evidence_snippets(
-        unique_strings(snippets)
-            .into_iter()
-            .rev()
-            .take(12)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect(),
+    bound_evidence_snippets(unique_strings(snippets))
+}
+
+fn tool_event_id(event: &ArcEvent) -> Option<String> {
+    event.tool_use_id.clone().or_else(|| {
+        event
+            .raw
+            .as_ref()
+            .and_then(|raw| raw.get("data"))
+            .and_then(|data| data.get("toolCallId"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    })
+}
+
+fn tool_event_failed(event: &ArcEvent) -> bool {
+    event.tool_status.as_deref() == Some("failed")
+        || event.exit_code.is_some_and(|exit_code| exit_code != 0)
+}
+
+fn tail_items<T>(items: Vec<T>, limit: usize) -> Vec<T> {
+    let skip = items.len().saturating_sub(limit);
+    items.into_iter().skip(skip).collect()
+}
+
+fn snippet_from_command_result(
+    event: &ArcEvent,
+    start: Option<&ArcEvent>,
+    workspace: &str,
+) -> String {
+    let status = event
+        .tool_status
+        .clone()
+        .unwrap_or_else(|| match event.exit_code {
+            Some(0) => "success".to_owned(),
+            Some(_) => "failed".to_owned(),
+            None => "unknown".to_owned(),
+        });
+    let result = event
+        .exit_code
+        .map(|exit_code| format!("exit code {exit_code}"))
+        .unwrap_or_else(|| format!("status {status}"));
+    let command = event
+        .command
+        .as_ref()
+        .or_else(|| start.and_then(|value| value.command.as_ref()))
+        .map(|value| clean_snippet(value, 260, workspace))
+        .unwrap_or_else(|| event.tool_name.as_deref().unwrap_or("command").to_owned());
+    let output = event
+        .text
+        .as_deref()
+        .map(|text| clean_tail_snippet(text, 420, workspace))
+        .filter(|value| !value.is_empty())
+        .map(|value| format!("\noutput tail:\n{value}"))
+        .unwrap_or_default();
+    clean_snippet(
+        &format!("{status} command result ({result}): {command}{output}"),
+        700,
+        workspace,
     )
 }
 
-fn snippet_from_tool_end(event: &ArcEvent, workspace: &str) -> Option<String> {
+fn snippet_from_incomplete_command(event: &ArcEvent, workspace: &str) -> Option<String> {
+    let command = event.command.as_ref()?;
+    Some(clean_snippet(
+        &format!(
+            "incomplete command (no completion event observed): {}",
+            clean_snippet(command, 340, workspace)
+        ),
+        400,
+        workspace,
+    ))
+}
+
+fn snippet_from_tool_end(
+    event: &ArcEvent,
+    workspace: &str,
+    max_length: usize,
+    use_tail: bool,
+) -> Option<String> {
     let label = event.tool_name.as_deref().unwrap_or("tool");
     let status = event
         .tool_status
@@ -2249,14 +2539,17 @@ fn snippet_from_tool_end(event: &ArcEvent, workspace: &str) -> Option<String> {
         .as_ref()
         .map(|value| portable_snippet_text(value, workspace))
         .unwrap_or_else(|| label.to_owned());
-    let text = event
-        .text
-        .as_ref()
-        .map(|text| format!("\n{text}"))
-        .unwrap_or_default();
+    let text = event.text.as_ref().map_or_else(String::new, |text| {
+        let excerpt = if use_tail {
+            clean_tail_snippet(text, max_length.saturating_sub(100), workspace)
+        } else {
+            clean_snippet(text, max_length.saturating_sub(100), workspace)
+        };
+        format!("\n{excerpt}")
+    });
     let snippet = clean_snippet(
         &format!("{status} {label}: {command}{text}"),
-        900,
+        max_length,
         workspace,
     );
     if snippet.is_empty() {
@@ -2311,6 +2604,26 @@ fn clean_snippet(value: &str, max_length: usize, workspace: &str) -> String {
     )
 }
 
+fn clean_tail_snippet(value: &str, max_length: usize, workspace: &str) -> String {
+    let compact = redact_sensitive(&portable_snippet_text(value, workspace))
+        .replace('\r', "")
+        .replace("\n\n\n", "\n\n")
+        .trim()
+        .to_owned();
+    let length = compact.chars().count();
+    if length <= max_length {
+        return compact;
+    }
+    format!(
+        "...{}",
+        compact
+            .chars()
+            .skip(length.saturating_sub(max_length.saturating_sub(3)))
+            .collect::<String>()
+            .trim_start()
+    )
+}
+
 fn portable_snippet_text(value: &str, workspace: &str) -> String {
     let root = PathBuf::from(workspace);
     let root = root.to_string_lossy();
@@ -2354,7 +2667,7 @@ fn review_capsules(review: Option<&Value>) -> Vec<Value> {
 }
 
 fn capsule_allowed_for_outcome(capsule: &Value, status: &str) -> bool {
-    if status != "failed" && status != "aborted" {
+    if status != "partial" && status != "failed" && status != "aborted" {
         return true;
     }
     let kind = capsule
@@ -2522,6 +2835,364 @@ fn review_record(
 
 fn record_review(workspace: &Path, record: ReviewRecord) -> Result<()> {
     append_jsonl(&reviewed_path(workspace), &record)
+}
+
+fn record_declined_draft(
+    workspace: &Path,
+    review_input: &Value,
+    session_id: &str,
+    outcome: &str,
+    reason: &str,
+) -> Result<()> {
+    let merge_key = review_input
+        .get("mergeKey")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if merge_key.is_empty() {
+        return Ok(());
+    }
+    let record = DeclinedDraftRecord {
+        id: format!(
+            "declined-{}",
+            &sha256_hex(&format!("{session_id}\n{merge_key}"))[..16]
+        ),
+        merge_key: merge_key.to_owned(),
+        created_at: now_iso(),
+        session_id: session_id.to_owned(),
+        outcome: outcome.to_owned(),
+        reason: reason.to_owned(),
+        draft: Some(redact_json(review_input)),
+        promoted_at: None,
+        promoted_capsule_id: None,
+    };
+    let mut records = load_retained_declined_drafts(workspace)?;
+    records.retain(|existing| existing.id != record.id);
+    records.push(record);
+    write_retained_declined_drafts(workspace, records)
+}
+
+pub(crate) fn load_declined_draft_views(workspace: &Path) -> Result<Vec<DeclinedDraftView>> {
+    let mut records = load_retained_declined_drafts(workspace)?
+        .into_iter()
+        .filter(|record| record.promoted_capsule_id.is_none())
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    Ok(records
+        .into_iter()
+        .map(|record| declined_draft_view(&record))
+        .collect())
+}
+
+pub(crate) fn promote_declined_draft(
+    id_or_prefix: &str,
+    workspace: &Path,
+) -> Result<(String, Capsule)> {
+    let mut records = load_retained_declined_drafts(workspace)?;
+    let index = records
+        .iter()
+        .position(|record| record.id == id_or_prefix || record.id.starts_with(id_or_prefix))
+        .ok_or_else(|| anyhow!("No declined draft matches {id_or_prefix}"))?;
+    if let Some(capsule_id) = records[index].promoted_capsule_id.as_deref() {
+        let capsule = load_capsules(workspace)?
+            .into_iter()
+            .find(|capsule| capsule.id == capsule_id)
+            .ok_or_else(|| anyhow!("Declined draft was promoted, but its capsule is missing"))?;
+        return Ok((records[index].id.clone(), capsule));
+    }
+    let draft = records[index]
+        .draft
+        .as_ref()
+        .ok_or_else(|| anyhow!("Declined draft predates recoverable draft storage"))?;
+    let capsule = capsule_from_declined_draft(&records[index], draft, workspace)?;
+    let saved = save_capsule(capsule, workspace)?
+        .ok_or_else(|| anyhow!("Declined draft could not be promoted"))?;
+    let declined_id = records[index].id.clone();
+    records[index].promoted_at = Some(now_iso());
+    records[index].promoted_capsule_id = Some(saved.id.clone());
+    write_retained_declined_drafts(workspace, records)?;
+    record_memory_event(
+        workspace,
+        "capsule.promoted",
+        Some(saved.source_session_id.clone()),
+        None,
+        Some(saved.id.clone()),
+        Some(json!({
+            "declinedDraftId": declined_id,
+            "promotedBy": "user",
+            "title": saved.title,
+            "reason": "user promoted a declined draft"
+        })),
+    )?;
+    record_judge_decision(
+        workspace,
+        Some(saved.source_session_id.clone()),
+        &format!("user promoted declined draft {declined_id}"),
+        "user-override",
+        None,
+        vec![JudgeCandidate {
+            capsule_id: saved.id.clone(),
+            score: 1.0,
+            reputation: None,
+        }],
+        JudgeVerdict {
+            inject: Some(saved.id.clone()),
+            abstain: Some(false),
+            confidence: Some(1.0),
+            reason: Some("user promoted a previously declined draft".to_owned()),
+        },
+        Some(JudgeOutcome {
+            injected: Some(true),
+            used: Some("yes".to_owned()),
+            helped: Some("yes".to_owned()),
+        }),
+    )?;
+    Ok((declined_id, saved))
+}
+
+fn capsule_from_declined_draft(
+    record: &DeclinedDraftRecord,
+    draft: &Value,
+    workspace: &Path,
+) -> Result<Capsule> {
+    let goal = draft
+        .get("goal")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| {
+            draft
+                .get("prompts")
+                .and_then(Value::as_array)
+                .and_then(|values| values.iter().rev().find_map(Value::as_str))
+                .filter(|value| !value.trim().is_empty())
+        })
+        .unwrap_or("Recovered declined method");
+    let evidence = value_array_strings(draft.get("evidenceSnippets"));
+    let commands = value_array_strings(draft.get("commands"));
+    let parameters = value_array_strings(draft.get("parameters"));
+    let paths = value_array_strings(draft.get("paths"));
+    let successful = record.outcome == "success";
+    let title = truncate(goal, 100);
+    let summary = if successful {
+        format!("User-promoted method recovered from verified evidence: {title}")
+    } else {
+        format!(
+            "User-promoted caution recovered from a {} goal: {title}",
+            record.outcome
+        )
+    };
+    let success_evidence = evidence
+        .iter()
+        .filter(|value| {
+            let normalized = value.to_lowercase();
+            normalized.contains("success") || normalized.contains("exit code 0")
+        })
+        .cloned()
+        .take(4)
+        .collect::<Vec<_>>();
+    let mut capsule = Capsule {
+        runner: draft
+            .get("runner")
+            .and_then(Value::as_str)
+            .unwrap_or("copilot")
+            .to_owned(),
+        workspace: workspace.to_string_lossy().to_string(),
+        source_session_id: record.session_id.clone(),
+        source_session_ids: vec![record.session_id.clone()],
+        status: "local".to_owned(),
+        privacy_label: "local".to_owned(),
+        kind: if successful {
+            "workflow".to_owned()
+        } else {
+            "project_fact".to_owned()
+        },
+        merge_key: record.merge_key.clone(),
+        title,
+        summary,
+        reusable: true,
+        confidence: if successful { 0.5 } else { 0.35 },
+        reuse_when: vec![goal.to_owned()],
+        do_not_reuse_when: if successful {
+            Vec::new()
+        } else {
+            vec![format!(
+                "when the {} outcome has not been independently revalidated",
+                record.outcome
+            )]
+        },
+        evidence,
+        provenance: vec![
+            "promoted-by-user".to_owned(),
+            format!("declinedDraft:{}", record.id),
+        ],
+        confidence_reason: format!(
+            "Conservative confidence because the reviewer declined this {} draft before explicit user promotion.",
+            record.outcome
+        ),
+        failure_boundary: if successful {
+            vec![format!("Original reviewer declined capture: {}", record.reason)]
+        } else {
+            vec![format!(
+                "Original outcome was {}; do not treat this as a verified positive workflow.",
+                record.outcome
+            )]
+        },
+        validation_provenance: vec![
+            format!("original draft outcome: {}", record.outcome),
+            "promoted explicitly by user".to_owned(),
+        ],
+        outcome_status: record.outcome.clone(),
+        next_run_instruction: if successful {
+            format!("Reuse the recorded method for {goal}, then verify the same success evidence.")
+        } else {
+            format!(
+                "Treat the prior {} result as a caution and verify fresh evidence before acting.",
+                record.outcome
+            )
+        },
+        workflow: WorkflowCapsule {
+            purpose: goal.to_owned(),
+            parameters,
+            binding_sources: paths.into_iter().take(12).collect(),
+            steps: if successful {
+                commands.clone()
+            } else {
+                vec!["Inspect the recorded failure evidence before choosing a new route.".to_owned()]
+            },
+            commands: if successful {
+                commands.clone()
+            } else {
+                Vec::new()
+            },
+            success_criteria: if successful {
+                success_evidence
+            } else {
+                Vec::new()
+            },
+            failed_attempts: if successful {
+                Vec::new()
+            } else {
+                commands.clone()
+            },
+            validation_probe: if successful {
+                commands.last().cloned().into_iter().collect()
+            } else {
+                Vec::new()
+            },
+        },
+        ..Capsule::default()
+    };
+    capsule.artifact_sources = value_array_strings(draft.get("artifactSources"));
+    Ok(capsule)
+}
+
+fn load_retained_declined_drafts(workspace: &Path) -> Result<Vec<DeclinedDraftRecord>> {
+    let cutoff = Utc::now() - chrono::Duration::days(30);
+    let mut records = read_jsonl_values(&declined_path(workspace))?
+        .into_iter()
+        .filter_map(|value| serde_json::from_value::<DeclinedDraftRecord>(value).ok())
+        .filter(|record| {
+            DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created| created.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    if records.len() > 50 {
+        records.drain(0..records.len() - 50);
+    }
+    Ok(records)
+}
+
+fn write_retained_declined_drafts(
+    workspace: &Path,
+    records: Vec<DeclinedDraftRecord>,
+) -> Result<()> {
+    let cutoff = Utc::now() - chrono::Duration::days(30);
+    let mut records = records
+        .into_iter()
+        .filter(|record| {
+            DateTime::parse_from_rfc3339(&record.created_at)
+                .map(|created| created.with_timezone(&Utc) >= cutoff)
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| left.created_at.cmp(&right.created_at));
+    if records.len() > 50 {
+        records.drain(0..records.len() - 50);
+    }
+    write_jsonl(&declined_path(workspace), &records)
+}
+
+fn declined_draft_view(record: &DeclinedDraftRecord) -> DeclinedDraftView {
+    let title = record
+        .draft
+        .as_ref()
+        .and_then(|draft| draft.get("goal"))
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| truncate(value, 100))
+        .unwrap_or_else(|| "Declined capture".to_owned());
+    let summary = record
+        .draft
+        .as_ref()
+        .and_then(|draft| draft.get("evidenceSnippets"))
+        .and_then(Value::as_array)
+        .and_then(|values| values.first())
+        .and_then(Value::as_str)
+        .map(|value| truncate(value, 180))
+        .unwrap_or_else(|| format!("{} outcome", record.outcome));
+    let age_seconds = DateTime::parse_from_rfc3339(&record.created_at)
+        .map(|created| {
+            (Utc::now() - created.with_timezone(&Utc))
+                .num_seconds()
+                .max(0)
+        })
+        .unwrap_or(0);
+    DeclinedDraftView {
+        id: record.id.clone(),
+        merge_key: record.merge_key.clone(),
+        title,
+        summary,
+        session_id: record.session_id.clone(),
+        outcome: record.outcome.clone(),
+        reason: record.reason.clone(),
+        created_at: record.created_at.clone(),
+        age_seconds,
+    }
+}
+
+fn add_recurrence_provenance(
+    capsule: &mut Map<String, Value>,
+    recurrence: &ReviewRecurrence,
+    session_id: &str,
+) {
+    let provenance = capsule
+        .entry("provenance".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(values) = provenance {
+        values.push(Value::String(format!(
+            "recurrenceCount: {}",
+            recurrence.count
+        )));
+    }
+    let source_session_ids = capsule
+        .entry("sourceSessionIds".to_owned())
+        .or_insert_with(|| Value::Array(Vec::new()));
+    if let Value::Array(values) = source_session_ids {
+        for source_session_id in recurrence
+            .prior_session_ids
+            .iter()
+            .map(String::as_str)
+            .chain(std::iter::once(session_id))
+        {
+            if !values
+                .iter()
+                .any(|value| value.as_str() == Some(source_session_id))
+            {
+                values.push(Value::String(source_session_id.to_owned()));
+            }
+        }
+    }
 }
 
 pub(crate) fn record_sidecar_exchange(
@@ -3143,5 +3814,234 @@ mod split_harvest_tests {
             trace_path(session_id, &workspace).exists(),
             "split session should be harvested into a trace even though SessionEnd never fired"
         );
+    }
+
+    #[test]
+    fn assembled_draft_preserves_completed_command_exit_and_output_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let trace = tmp.path().join("synthetic-trace.jsonl");
+        let session_id = "evidence-session";
+        let mut records = vec![json!({
+            "type": "user.message",
+            "timestamp": "2026-01-01T00:00:00.000Z",
+            "data": { "content": "verify the build" }
+        })];
+        for index in 0..12 {
+            records.push(json!({
+                "type": "tool.execution_complete",
+                "timestamp": "2026-01-01T00:00:01.000Z",
+                "data": {
+                    "toolCallId": format!("read-{index}"),
+                    "success": true,
+                    "result": { "content": "source listing ".repeat(100) }
+                }
+            }));
+        }
+        records.push(json!({
+            "type": "tool.execution_start",
+            "timestamp": "2026-01-01T00:00:02.000Z",
+            "data": {
+                "toolCallId": "command-1",
+                "toolName": "bash",
+                "arguments": { "command": "run-build --check" }
+            }
+        }));
+        records.push(json!({
+            "type": "tool.execution_complete",
+            "timestamp": "2026-01-01T00:00:03.000Z",
+            "data": {
+                "toolCallId": "command-1",
+                "success": true,
+                "result": {
+                    "content": format!(
+                        "{}\nBUILD_OUTPUT_CONFIRMED\n<shellId: 1 completed with exit code 0>",
+                        "old output\n".repeat(100)
+                    )
+                }
+            }
+        }));
+        fs::write(
+            &trace,
+            records
+                .iter()
+                .map(|record| serde_json::to_string(record).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let events = read_copilot_transcript_events(&trace, &workspace, session_id).unwrap();
+        let packet = build_evidence_packet(&events, &workspace, session_id);
+        let draft = strong_review_input(&packet, "auto").unwrap();
+        let evidence = draft
+            .get("evidenceSnippets")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert_eq!(
+            draft.get("packetKind").and_then(Value::as_str),
+            Some("assembled_draft")
+        );
+        assert!(evidence.contains("exit code 0"), "{evidence}");
+        assert!(evidence.contains("BUILD_OUTPUT_CONFIRMED"), "{evidence}");
+        assert!(evidence.contains("run-build --check"), "{evidence}");
+    }
+
+    #[test]
+    fn second_review_with_same_merge_key_gets_recurrence_note() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let packet = |session_id: &str| EvidencePacket {
+            runner: "copilot".to_owned(),
+            session_id: session_id.to_owned(),
+            workspace: workspace.to_string_lossy().to_string(),
+            created_at: now_iso(),
+            episodes: Vec::new(),
+            prompts: vec!["verify the package".to_owned()],
+            assistant_messages: Vec::new(),
+            tool_events: Vec::new(),
+            commands: vec!["package-check --target sample".to_owned()],
+            paths: Vec::new(),
+            event_count: 2,
+            outcome: EvidenceOutcome {
+                status: "success".to_owned(),
+                confidence: 1.0,
+                reasons: Vec::new(),
+                success_signals: Vec::new(),
+                failure_signals: Vec::new(),
+                aborted_signals: Vec::new(),
+            },
+        };
+        let first = strong_review_input(&packet("session-one"), "auto").unwrap();
+        let second = strong_review_input(&packet("session-two"), "auto").unwrap();
+        assert_eq!(first.get("mergeKey"), second.get("mergeKey"));
+        record_declined_draft(
+            &workspace,
+            &first,
+            "session-one",
+            "success",
+            "looked one-off",
+        )
+        .unwrap();
+
+        let recurrence = recurrence_context(&second, &workspace, "session-two")
+            .unwrap()
+            .unwrap();
+        let context =
+            review_context_from_options(&ReviewOptions::default(), Some(&recurrence)).unwrap();
+        let prompt = review_prompt(&second, &[], Some(&context));
+
+        assert_eq!(recurrence.count, 2);
+        assert!(
+            prompt.contains("observed 2 times across sessions"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("previously declined: looked one-off"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("Recurrence is evidence of reusability"),
+            "{prompt}"
+        );
+
+        let mut capsule = Map::new();
+        add_recurrence_provenance(&mut capsule, &recurrence, "session-two");
+        assert_eq!(
+            capsule
+                .get("provenance")
+                .and_then(Value::as_array)
+                .and_then(|values| values.first())
+                .and_then(Value::as_str),
+            Some("recurrenceCount: 2")
+        );
+    }
+
+    #[test]
+    fn declined_ledger_keeps_only_fifty_recent_drafts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        let mut records = (0..52)
+            .map(|index| DeclinedDraftRecord {
+                id: format!("declined-{index:02}"),
+                merge_key: format!("draft:{index:02}"),
+                created_at: (Utc::now() + chrono::Duration::seconds(index)).to_rfc3339(),
+                session_id: format!("session-{index:02}"),
+                outcome: "success".to_owned(),
+                reason: "one-off".to_owned(),
+                draft: Some(json!({ "goal": format!("goal {index}") })),
+                promoted_at: None,
+                promoted_capsule_id: None,
+            })
+            .collect::<Vec<_>>();
+        records.push(DeclinedDraftRecord {
+            id: "declined-old".to_owned(),
+            merge_key: "draft:old".to_owned(),
+            created_at: (Utc::now() - chrono::Duration::days(31)).to_rfc3339(),
+            session_id: "session-old".to_owned(),
+            outcome: "success".to_owned(),
+            reason: "old".to_owned(),
+            draft: None,
+            promoted_at: None,
+            promoted_capsule_id: None,
+        });
+
+        write_retained_declined_drafts(&workspace, records).unwrap();
+        let retained = read_jsonl_values(&declined_path(&workspace)).unwrap();
+
+        assert_eq!(retained.len(), 50);
+        assert!(retained
+            .iter()
+            .all(|value| value.get("id").and_then(Value::as_str) != Some("declined-old")));
+        assert_eq!(
+            retained[0].get("id").and_then(Value::as_str),
+            Some("declined-02")
+        );
+    }
+
+    #[test]
+    fn partial_outcomes_salvage_cautions_but_block_positive_workflows() {
+        let positive = json!({
+            "kind": "workflow",
+            "workflow": {
+                "commands": ["run-task"],
+                "successCriteria": ["task exits 0"],
+                "failedAttempts": []
+            }
+        });
+        let caution = json!({
+            "kind": "project_fact",
+            "workflow": {
+                "commands": [],
+                "successCriteria": [],
+                "failedAttempts": ["run-task stopped before validation"]
+            }
+        });
+        assert!(!capsule_allowed_for_outcome(&positive, "partial"));
+        assert!(capsule_allowed_for_outcome(&caution, "partial"));
+
+        let draft = json!({
+            "packetKind": "assembled_draft",
+            "runner": "copilot",
+            "sessionId": "partial-session",
+            "mergeKey": "draft:partial",
+            "goal": "inspect a partial result",
+            "outcome": { "status": "partial" }
+        });
+        let prompt = review_prompt(&draft, &[], None);
+        assert!(prompt.contains(
+            "prefer salvaging a concrete caution, dead end, or project fact"
+        ));
+        assert!(prompt.contains(
+            "Decline only when nothing in the evidence could help a future similar session"
+        ));
     }
 }

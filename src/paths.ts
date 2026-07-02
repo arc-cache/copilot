@@ -93,6 +93,10 @@ export function reviewedPath(workspace = workspaceRoot()): string {
   return join(ensureCache(workspace), "reviewed.jsonl");
 }
 
+export function declinedPath(workspace = workspaceRoot()): string {
+  return join(ensureCache(workspace), "declined.jsonl");
+}
+
 export function judgeDecisionsPath(workspace = workspaceRoot()): string {
   return join(ensureCache(workspace), "judge-decisions.jsonl");
 }

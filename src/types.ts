@@ -66,6 +66,7 @@ export interface AssembledDraft {
   workspace: string;
   createdAt: string;
   goalId: string;
+  mergeKey: string;
   span: {
     startEventId?: string;
     endEventId?: string;
@@ -278,13 +279,20 @@ export interface LocalObserverStatus {
 
 export type ReviewIntent = "auto" | "user-requested";
 
+export interface ReviewRecurrence {
+  mergeKey: string;
+  recurrenceCount: number;
+  priorDeclineReason: string;
+  priorSessionIds: string[];
+}
+
 export interface SidecarReviewRequest {
   runner: Runner;
   intent: ReviewIntent;
   packet: ReviewPacket;
   prompt: string;
   existingCapsules?: Capsule[];
-  reviewContext?: Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds">;
+  reviewContext?: Pick<SidecarReviewOptions, "consultApplied" | "consultCapsuleId" | "consultAbstainReason" | "actionRisk" | "injectedCapsuleIds" | "judgeDecisionIds" | "recurrence">;
 }
 
 export interface SidecarReviewOptions {
@@ -295,4 +303,5 @@ export interface SidecarReviewOptions {
   consultCapsuleId?: string;
   consultAbstainReason?: string;
   actionRisk?: string;
+  recurrence?: ReviewRecurrence;
 }

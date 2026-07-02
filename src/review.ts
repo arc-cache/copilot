@@ -1,9 +1,10 @@
 import { buildEvidencePacket } from "./evidence.js";
+import { recordDeclinedDraft, reviewRecurrence } from "./declined.js";
 import { recordMemoryEvent } from "./ledger.js";
 import { workspaceRoot } from "./paths.js";
 import { refreshCapsuleDerivedData } from "./retrieval.js";
 import { recordJudgeOutcome } from "./retrieval-reputation.js";
-import { reviewPacket } from "./sidecar.js";
+import { assembledDraftFromEvidence, draftMergeKeyFromEvidence, reviewPacket } from "./sidecar.js";
 import { alreadyReviewed, debug, recordReview, saveCapsule, traceHash, withReviewLock } from "./store.js";
 import type { ReviewRecord } from "./store.js";
 import type { ArcEvent, ReviewIntent, SidecarReview, SidecarReviewOptions } from "./types.js";
@@ -68,6 +69,9 @@ async function reviewEventsUnlocked(
   options: SidecarReviewOptions
 ): Promise<ReviewOutcome> {
   const packet = buildEvidencePacket(events, workspace, sessionId);
+  const reviewDraft = assembledDraftFromEvidence(packet);
+  const mergeKey = draftMergeKeyFromEvidence(packet);
+  const recurrence = await reviewRecurrence(mergeKey, sessionId, workspace);
   const hash = traceHash(events);
   const correction = correctionSignal(events);
   try {
@@ -75,7 +79,7 @@ async function reviewEventsUnlocked(
     if (options.injectedCapsuleIds?.length) {
       await debug("review.injected_context", { sessionId, injectedCapsuleIds: options.injectedCapsuleIds }, workspace);
     }
-    const review = await reviewPacket(packet, workspace, intent, options);
+    const review = await reviewPacket(packet, workspace, intent, { ...options, recurrence });
     const capsuleInputs = reviewCapsules(review);
     const outcomeAllowedCapsules = capsuleInputs.filter((capsuleInput) => capsuleAllowedForOutcome(capsuleInput, packet.outcome.status));
     let saveableCapsules = outcomeAllowedCapsules.filter((capsuleInput) => capsuleAllowedForActionRisk(capsuleInput, options));
@@ -137,7 +141,17 @@ async function reviewEventsUnlocked(
     if (saveableCapsules.length) {
       const saved: string[] = [];
       for (const { capsule: capsuleInput } of sanitized) {
-        const capsule = await saveCapsule({ ...capsuleInput, sourceSessionId: sessionId, workspace, runner: packet.runner, outcomeStatus: packet.outcome.status }, workspace);
+        const capsule = await saveCapsule({
+          ...capsuleInput,
+          sourceSessionId: sessionId,
+          sourceSessionIds: recurrence ? [...recurrence.priorSessionIds, sessionId] : capsuleInput.sourceSessionIds,
+          provenance: recurrence
+            ? [...(capsuleInput.provenance ?? []), `recurrenceCount: ${recurrence.recurrenceCount}`]
+            : capsuleInput.provenance,
+          workspace,
+          runner: packet.runner,
+          outcomeStatus: packet.outcome.status
+        }, workspace);
         if (capsule) {
           const enriched = await refreshCapsuleDerivedData(capsule, workspace);
           saved.push(enriched.id);
@@ -153,6 +167,7 @@ async function reviewEventsUnlocked(
           sessionId,
           details: { reason, outcome: packet.outcome.status, eventCount: events.length }
         });
+        await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace, reviewDraft);
         const result: ReviewOutcome = { status: "no_capsule", reason };
         await reconcileJudgeOutcome(workspace, sessionId, packet, options, result, correction);
         return result;
@@ -189,6 +204,7 @@ async function reviewEventsUnlocked(
           correctionReasons: correction.detected ? correction.reasons : undefined
         }
       });
+      await recordDeclinedDraft(mergeKey, sessionId, packet.outcome.status, reason, workspace, reviewDraft);
       const result: ReviewOutcome = { status: "no_capsule", reason };
       await reconcileJudgeOutcome(workspace, sessionId, packet, options, result, correction);
       return result;
@@ -258,7 +274,7 @@ function inferInjectedOutcome(
 }
 
 function capsuleAllowedForOutcome(capsule: NonNullable<SidecarReview["capsules"]>[number], status: string): boolean {
-  if (status !== "failed" && status !== "aborted") return true;
+  if (status !== "partial" && status !== "failed" && status !== "aborted") return true;
   const kind = String(capsule.kind ?? "").toLowerCase();
   if (kind.includes("fact") || kind.includes("dead_end") || kind.includes("caution")) return true;
   const failedAttempts = capsule.workflow?.failedAttempts ?? [];

@@ -8,6 +8,7 @@ import { join } from "node:path";
 import { importCopilotOtel, importCopilotTranscript, launchCopilot, harvestSession } from "./copilot.js";
 import { runAcpProxy } from "./acp.js";
 import { runAsk } from "./ask.js";
+import { loadDeclinedDraftViews, promoteDeclinedDraft } from "./declined.js";
 import { loadMemoryEvents } from "./ledger.js";
 import { reviewEvents } from "./review.js";
 import { writeDebugBundle } from "./bundle.js";
@@ -333,6 +334,28 @@ async function runStatus(args: string[], workspace: string): Promise<void> {
 async function runCapsules(args: string[], workspace: string): Promise<void> {
   const json = hasJson(args);
   const clean = stripFlag(args, "--json");
+  if (clean[0] === "declined") {
+    assertKnownFlags(clean.slice(1), new Set());
+    const declined = await loadDeclinedDraftViews(workspace);
+    if (json) writeJson({ declined });
+    else {
+      console.log(`${declined.length} declined draft${declined.length === 1 ? "" : "s"}`);
+      for (const draft of declined) {
+        console.log(`${draft.id.slice(0, 18)}  ${draft.outcome}  ${ageFromSeconds(draft.ageSeconds)}  ${draft.title}`);
+        console.log(`  ${draft.reason.slice(0, 120)}`);
+      }
+    }
+    return;
+  }
+  if (clean[0] === "promote") {
+    assertKnownFlags(clean.slice(1), new Set());
+    const id = clean[1];
+    if (!id) throw new Error("Usage: arc capsules promote <id> [--json]");
+    const promoted = await promoteDeclinedDraft(id, workspace);
+    if (json) writeJson(promoted);
+    else console.log(`promoted ${promoted.declinedDraftId} to capsule ${promoted.capsule.id}`);
+    return;
+  }
   if (clean[0] === "set") {
     await runCapsuleSet(clean.slice(1), workspace, json);
     return;
@@ -354,6 +377,12 @@ async function runCapsules(args: string[], workspace: string): Promise<void> {
       console.log(`${capsule.id.slice(0, 8)}  ${capsule.status}/${capsule.privacyLabel}  ${capsule.title}`);
     }
   }
+}
+
+function ageFromSeconds(seconds: number): string {
+  if (seconds >= 86_400) return `${Math.floor(seconds / 86_400)}d`;
+  if (seconds >= 3_600) return `${Math.floor(seconds / 3_600)}h`;
+  return `${Math.floor(seconds / 60)}m`;
 }
 
 async function runCapsuleSet(args: string[], workspace: string, json: boolean): Promise<void> {
@@ -603,6 +632,8 @@ Usage:
   arc capsules [--json]
   arc capsules <id> [--json]
   arc capsules set <id> [--status <s>] [--privacy <label>] [--json]
+  arc capsules declined [--json]
+  arc capsules promote <id> [--json]
   arc events [--json] [--limit N]
   arc probe "<prompt>" [--json]
   arc judge [status|models|decisions|reputation|set] [--json] [--mode embedding-only|provider-judge] [--model provider:id]

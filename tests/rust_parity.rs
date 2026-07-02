@@ -56,6 +56,75 @@ fn rust_matches_ts_for_seeded_json_commands() {
 }
 
 #[test]
+fn rust_declined_list_and_promotion_round_trip() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let cache = workspace.join(".agent-run-cache");
+    fs::create_dir_all(&cache).unwrap();
+    let declined = serde_json::json!({
+        "id": "declined-promote-test",
+        "mergeKey": "draft:promote-test",
+        "createdAt": chrono::Utc::now().to_rfc3339(),
+        "sessionId": "declined-session",
+        "outcome": "success",
+        "reason": "reviewer considered this one-off",
+        "draft": {
+            "packetKind": "assembled_draft",
+            "runner": "copilot",
+            "sessionId": "declined-session",
+            "workspace": workspace,
+            "goal": "Validate the local package",
+            "prompts": ["Validate the local package"],
+            "evidenceSnippets": [
+                "success command result (exit code 0): package-check\noutput tail:\nPACKAGE_OK"
+            ],
+            "commands": ["package-check --local"],
+            "parameters": ["--local"],
+            "paths": ["package.json"],
+            "outcome": { "status": "success" }
+        }
+    });
+    fs::write(cache.join("declined.jsonl"), format!("{declined}\n")).unwrap();
+
+    let listed = run_rust_json(&["capsules", "declined", "--json"], &workspace, None);
+    let row = &listed["declined"][0];
+    assert_eq!(row["id"], "declined-promote-test");
+    assert_eq!(row["title"], "Validate the local package");
+    assert_eq!(row["sessionId"], "declined-session");
+    assert_eq!(row["reason"], "reviewer considered this one-off");
+    assert!(row["ageSeconds"].is_number());
+    assert!(row.get("draft").is_none());
+    let ui = run_rust_json(&["tab", "--json"], &workspace, None);
+    assert_eq!(ui["declined"][0]["id"], "declined-promote-test");
+    assert_eq!(ui["status"]["declinedCount"], 1);
+
+    let promoted = run_rust_json(
+        &["capsules", "promote", "declined-promote-test", "--json"],
+        &workspace,
+        None,
+    );
+    let capsule_id = promoted["capsule"]["id"].as_str().unwrap();
+    assert_eq!(promoted["declinedDraftId"], "declined-promote-test");
+    assert_eq!(promoted["capsule"]["confidence"], 0.5);
+    assert!(promoted["capsule"]["provenance"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|value| value == "promoted-by-user"));
+
+    let capsules = run_rust_json(&["capsules", "--json"], &workspace, None);
+    assert_eq!(capsules["capsules"][0]["id"], capsule_id);
+    let remaining = run_rust_json(&["capsules", "declined", "--json"], &workspace, None);
+    assert_eq!(remaining["declined"].as_array().unwrap().len(), 0);
+
+    let decisions = fs::read_to_string(cache.join("judge-decisions.jsonl")).unwrap();
+    assert!(decisions.contains("\"mode\":\"user-override\""));
+    assert!(decisions.contains(capsule_id));
+    let reputation = fs::read_to_string(cache.join("retrieval-reputation.json")).unwrap();
+    assert!(reputation.contains(capsule_id));
+}
+
+#[test]
 fn rust_probe_and_hook_match_ts_recall_contract() {
     ensure_ts_build();
     let seed = tempfile::tempdir().unwrap();

@@ -240,7 +240,7 @@ export function normalizeCopilotRecord(raw: Record<string, unknown>, index: numb
   }
 
   const toolName = textValue(data.toolName ?? data.name ?? data.command);
-  const toolUseId = textValue(data.toolUseId ?? data.id ?? data.callId);
+  const toolUseId = textValue(data.toolUseId ?? data.toolCallId ?? data.id ?? data.callId);
   const command = commandFrom(data);
   if (rawType.includes("tool") && (toolName || command || rawType.includes("complete"))) {
     const complete = rawType.includes("end") || rawType.includes("complete");

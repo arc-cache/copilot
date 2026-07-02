@@ -72,6 +72,65 @@ test("capsules --json emits saved capsules", withCliCache(async ({ cwd, env }) =
   assert.equal(single.capsule.id, "cli-json-capsule");
 }));
 
+test("declined drafts list and promote through the CLI", withCliCache(async ({ cwd, env }) => {
+  const cache = join(cwd, ".agent-run-cache");
+  await mkdir(cache, { recursive: true });
+  const declined = {
+    id: "declined-cli-test",
+    mergeKey: "draft:declined-cli-test",
+    createdAt: new Date().toISOString(),
+    sessionId: "declined-cli-session",
+    outcome: "success",
+    reason: "reviewer considered this one-off",
+    draft: {
+      packetKind: "assembled_draft",
+      runner: "copilot",
+      sessionId: "declined-cli-session",
+      workspace: cwd,
+      createdAt: new Date().toISOString(),
+      goalId: "declined-goal",
+      mergeKey: "draft:declined-cli-test",
+      span: { eventCount: 2 },
+      goal: "Validate the local package",
+      prompts: ["Validate the local package"],
+      evidenceSnippets: ["success command result (exit code 0): package-check\noutput tail:\nPACKAGE_OK"],
+      commands: ["package-check --local"],
+      parameters: ["--local"],
+      paths: ["package.json"],
+      outcome: {
+        status: "success",
+        confidence: 1,
+        reasons: [],
+        successSignals: ["exit code 0"],
+        failureSignals: [],
+        abortedSignals: []
+      },
+      observations: [],
+      sourceEventIds: []
+    }
+  };
+  await writeFile(join(cache, "declined.jsonl"), `${JSON.stringify(declined)}\n`, "utf8");
+
+  const listed = parseJsonStdout(runCli(["capsules", "declined", "--json"], cwd, env));
+  assert.equal(listed.declined.length, 1);
+  assert.equal(listed.declined[0].title, "Validate the local package");
+  assert.equal(listed.declined[0].sessionId, "declined-cli-session");
+  assert.equal(typeof listed.declined[0].ageSeconds, "number");
+  assert.equal("draft" in listed.declined[0], false);
+
+  const promoted = parseJsonStdout(runCli(["capsules", "promote", "declined-cli-test", "--json"], cwd, env));
+  assert.equal(promoted.declinedDraftId, "declined-cli-test");
+  assert.equal(promoted.capsule.confidence, 0.5);
+  assert.equal(promoted.capsule.provenance.includes("promoted-by-user"), true);
+
+  const capsules = parseJsonStdout(runCli(["capsules", "--json"], cwd, env));
+  assert.equal(capsules.capsules[0].id, promoted.capsule.id);
+  const remaining = parseJsonStdout(runCli(["capsules", "declined", "--json"], cwd, env));
+  assert.equal(remaining.declined.length, 0);
+  assert.match(await readFile(join(cache, "judge-decisions.jsonl"), "utf8"), /"mode":"user-override"/);
+  assert.match(await readFile(join(cache, "retrieval-reputation.json"), "utf8"), new RegExp(promoted.capsule.id));
+}));
+
 test("hook command builder quotes POSIX and Windows runtime paths", () => {
   const posix = buildHookCommand(
     "/Applications/Node Current/bin/node",

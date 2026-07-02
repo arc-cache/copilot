@@ -8,7 +8,7 @@ use ratatui::{
     Frame, Terminal,
 };
 
-const NARROW_BREAKPOINT: u16 = 46;
+const NARROW_BREAKPOINT: u16 = 84;
 
 fn split_appliance_mode() -> bool {
     env::var("ARC_SPLIT_APPLIANCE")
@@ -140,6 +140,7 @@ fn run_ui_loop(
                         state.judge_models = load_judge_model_choices();
                         state.sync_model_selection(model.status.judge.model.as_ref());
                     }
+                    KeyCode::Char('4') | KeyCode::Char('d') => state.tab = UiTab::Declined,
                     KeyCode::Char('/') => {
                         state.tab = UiTab::Capsules;
                         state.filter_editing = true;
@@ -155,6 +156,14 @@ fn run_ui_loop(
                     KeyCode::Enter => {
                         if state.tab == UiTab::Settings {
                             apply_settings_selection(&mut state)?;
+                        } else if state.tab == UiTab::Declined && !model.declined.is_empty() {
+                            handle_ui_action(
+                                UiAction::PromoteDeclined(state.selected_declined),
+                                &model,
+                                &mut state,
+                                workspace,
+                                terminal,
+                            )?;
                         } else {
                             state.expanded = !state.expanded;
                         }
@@ -190,7 +199,9 @@ fn run_ui_loop(
                     {
                         handle_ui_action(action, &model, &mut state, workspace, terminal)?;
                     } else if mouse.row <= 3 {
-                        state.tab = if mouse.column > 28 {
+                        state.tab = if mouse.column > 43 {
+                            UiTab::Declined
+                        } else if mouse.column > 28 {
                             UiTab::Settings
                         } else if mouse.column > 13 {
                             UiTab::Activity
@@ -203,6 +214,9 @@ fn run_ui_loop(
                     } else if state.tab == UiTab::Activity && mouse.row > 6 {
                         state.selected_event = (mouse.row.saturating_sub(7) as usize / 2)
                             .min(model.recent_events.len().saturating_sub(1));
+                    } else if state.tab == UiTab::Declined && mouse.row > 6 {
+                        state.selected_declined = (mouse.row.saturating_sub(7) as usize / 4)
+                            .min(model.declined.len().saturating_sub(1));
                     }
                 }
                 _ => {}
@@ -218,6 +232,7 @@ fn run_ui_loop(
 enum UiTab {
     Capsules,
     Activity,
+    Declined,
     Settings,
 }
 
@@ -227,6 +242,7 @@ enum NarrowScreen {
     Capsules,
     CapsuleDetail,
     Activity,
+    Declined,
     Judge,
     Injection,
 }
@@ -253,6 +269,7 @@ enum UiAction {
     CopySection(DetailSection),
     CopyCommand(usize),
     ShareCapsule,
+    PromoteDeclined(usize),
     ToggleJudgeMode,
     SelectJudge(usize),
     SetInjection(InjectionChoice),
@@ -286,6 +303,7 @@ struct InteractiveUiState {
     appliance: bool,
     tab: UiTab,
     selected_capsule: usize,
+    selected_declined: usize,
     selected_event: usize,
     expanded: bool,
     filter: String,
@@ -307,6 +325,7 @@ impl Default for InteractiveUiState {
             appliance: split_appliance_mode(),
             tab: UiTab::Capsules,
             selected_capsule: 0,
+            selected_declined: 0,
             selected_event: 0,
             expanded: true,
             filter: String::new(),
@@ -332,6 +351,9 @@ impl InteractiveUiState {
         self.selected_event = self
             .selected_event
             .min(model.recent_events.len().saturating_sub(1));
+        self.selected_declined = self
+            .selected_declined
+            .min(model.declined.len().saturating_sub(1));
         self.settings_row = self.settings_row.min(1);
         self.selected_judge_model = self
             .selected_judge_model
@@ -340,7 +362,8 @@ impl InteractiveUiState {
 
     fn next_tab(&mut self) {
         self.tab = match self.tab {
-            UiTab::Capsules => UiTab::Activity,
+            UiTab::Capsules => UiTab::Declined,
+            UiTab::Declined => UiTab::Activity,
             UiTab::Activity => UiTab::Settings,
             UiTab::Settings => UiTab::Capsules,
         };
@@ -349,7 +372,8 @@ impl InteractiveUiState {
     fn previous_tab(&mut self) {
         self.tab = match self.tab {
             UiTab::Capsules => UiTab::Settings,
-            UiTab::Activity => UiTab::Capsules,
+            UiTab::Declined => UiTab::Capsules,
+            UiTab::Activity => UiTab::Declined,
             UiTab::Settings => UiTab::Activity,
         };
     }
@@ -364,6 +388,10 @@ impl InteractiveUiState {
                 self.selected_event =
                     (self.selected_event + 1).min(model.recent_events.len().saturating_sub(1));
             }
+            UiTab::Declined => {
+                self.selected_declined =
+                    (self.selected_declined + 1).min(model.declined.len().saturating_sub(1));
+            }
             UiTab::Settings => self.settings_row = (self.settings_row + 1).min(1),
         }
     }
@@ -372,6 +400,7 @@ impl InteractiveUiState {
         match self.tab {
             UiTab::Capsules => self.selected_capsule = self.selected_capsule.saturating_sub(1),
             UiTab::Activity => self.selected_event = self.selected_event.saturating_sub(1),
+            UiTab::Declined => self.selected_declined = self.selected_declined.saturating_sub(1),
             UiTab::Settings => self.settings_row = self.settings_row.saturating_sub(1),
         }
     }
@@ -423,7 +452,7 @@ fn handle_narrow_key(
             return Ok(NarrowKeyOutcome::Action(UiAction::Back));
         }
         KeyCode::Down | KeyCode::Char('j') => match state.narrow_screen {
-            NarrowScreen::Summary => state.narrow_row = (state.narrow_row + 1).min(3),
+            NarrowScreen::Summary => state.narrow_row = (state.narrow_row + 1).min(4),
             NarrowScreen::Capsules => {
                 state.selected_capsule =
                     (state.selected_capsule + 1).min(model.capsules.len().saturating_sub(1));
@@ -436,6 +465,14 @@ fn handle_narrow_key(
                 state.selected_event =
                     (state.selected_event + 1).min(model.recent_events.len().saturating_sub(1));
                 state.narrow_scroll = state.narrow_scroll.saturating_add(2);
+            }
+            NarrowScreen::Declined => {
+                state.selected_declined =
+                    (state.selected_declined + 1).min(model.declined.len().saturating_sub(1));
+                let selected_line = state.selected_declined.saturating_mul(4) as u16;
+                if selected_line > state.narrow_scroll.saturating_add(9) {
+                    state.narrow_scroll = selected_line.saturating_sub(9);
+                }
             }
             NarrowScreen::CapsuleDetail => {
                 let last = model
@@ -463,6 +500,12 @@ fn handle_narrow_key(
                 state.selected_event = state.selected_event.saturating_sub(1);
                 state.narrow_scroll = state.narrow_scroll.saturating_sub(2);
             }
+            NarrowScreen::Declined => {
+                state.selected_declined = state.selected_declined.saturating_sub(1);
+                state.narrow_scroll = state
+                    .narrow_scroll
+                    .min(state.selected_declined.saturating_mul(4) as u16);
+            }
             NarrowScreen::CapsuleDetail | NarrowScreen::Judge | NarrowScreen::Injection => {
                 state.narrow_row = state.narrow_row.saturating_sub(1);
             }
@@ -474,6 +517,9 @@ fn handle_narrow_key(
                 NarrowScreen::Summary => Some(UiAction::OpenSummaryRow(state.narrow_row)),
                 NarrowScreen::Capsules if !model.capsules.is_empty() => {
                     Some(UiAction::OpenCapsule(state.selected_capsule))
+                }
+                NarrowScreen::Declined if !model.declined.is_empty() => {
+                    Some(UiAction::PromoteDeclined(state.selected_declined))
                 }
                 NarrowScreen::CapsuleDetail => model
                     .capsules
@@ -495,6 +541,7 @@ fn handle_narrow_key(
                     _ => InjectionChoice::Today,
                 })),
                 NarrowScreen::Activity => None,
+                NarrowScreen::Declined => None,
                 NarrowScreen::Capsules => None,
             };
             if let Some(action) = action {
@@ -540,8 +587,9 @@ fn handle_ui_action(
         UiAction::OpenSummaryRow(row) => {
             state.narrow_screen = match row {
                 0 => NarrowScreen::Capsules,
-                1 => NarrowScreen::Activity,
-                2 => NarrowScreen::Judge,
+                1 => NarrowScreen::Declined,
+                2 => NarrowScreen::Activity,
+                3 => NarrowScreen::Judge,
                 _ => NarrowScreen::Injection,
             };
             state.narrow_row = 0;
@@ -618,6 +666,17 @@ fn handle_ui_action(
                 ),
                 ..ArcConfigPatch::default()
             })?;
+        }
+        UiAction::PromoteDeclined(index) => {
+            let declined = model
+                .declined
+                .get(index)
+                .ok_or_else(|| anyhow!("Declined draft selection is no longer available"))?;
+            let (_, capsule) = promote_declined_draft(&declined.id, workspace)?;
+            state.notice = Some(format!("promoted {}", short(&capsule.id, 8)));
+            state.selected_declined = state
+                .selected_declined
+                .min(model.declined.len().saturating_sub(2));
         }
         UiAction::CopySection(_) | UiAction::CopyCommand(_) | UiAction::ShareCapsule => {}
     }
@@ -734,6 +793,7 @@ fn draw_ui_frame(
     match state.tab {
         UiTab::Capsules => draw_capsules_tab(frame, chunks[2], model, state),
         UiTab::Activity => draw_activity_tab(frame, chunks[2], model, state),
+        UiTab::Declined => draw_declined_tab(frame, chunks[2], model, state, hit_regions),
         UiTab::Settings => draw_settings_tab(frame, chunks[2], model, state),
     }
 
@@ -774,6 +834,7 @@ fn draw_narrow_ui(
             draw_narrow_capsule_detail(frame, area, model, state, hit_regions)
         }
         NarrowScreen::Activity => draw_narrow_activity(frame, area, model, state, hit_regions),
+        NarrowScreen::Declined => draw_narrow_declined(frame, area, model, state, hit_regions),
         NarrowScreen::Judge => draw_narrow_judge(frame, area, model, state, hit_regions),
         NarrowScreen::Injection => draw_narrow_injection(frame, area, model, state, hit_regions),
     }
@@ -807,6 +868,7 @@ fn draw_narrow_summary(
     };
     let rows = [
         ("capsules", model.status.capsule_count.to_string()),
+        ("declined", model.status.declined_count.to_string()),
         ("activity", model.status.event_count.to_string()),
         ("judge", fit_words(judge, width.saturating_sub(13))),
         ("injection", fit_words(injection, width.saturating_sub(13))),
@@ -840,7 +902,7 @@ fn draw_narrow_summary(
             });
         }
     }
-    if area.height > 13 && !state.appliance {
+    if area.height > 15 && !state.appliance {
         lines.push(hairline(width));
         lines.push(Line::from(Span::styled(
             "click a row · scroll to read",
@@ -942,6 +1004,112 @@ fn draw_narrow_capsules(
         body,
         lines,
         line_actions,
+        Vec::new(),
+        state.narrow_scroll,
+        hit_regions,
+    );
+}
+
+fn draw_narrow_declined(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &ArcUiViewModel,
+    state: &InteractiveUiState,
+    hit_regions: &mut Vec<HitRegion>,
+) {
+    let width = area.width.max(1) as usize;
+    let header = Rect::new(area.x, area.y, area.width, area.height.min(2));
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled(
+                    "‹ declined",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" · {}", model.declined.len()),
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]),
+            hairline(width),
+        ]),
+        header,
+    );
+    hit_regions.push(HitRegion {
+        area: Rect::new(area.x, area.y, area.width, 1),
+        action: UiAction::Back,
+    });
+    if area.height <= 2 {
+        return;
+    }
+    let body = Rect::new(
+        area.x,
+        area.y + 2,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    if model.declined.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No declined drafts.").style(Style::default().fg(Color::DarkGray)),
+            body,
+        );
+        return;
+    }
+
+    let mut lines = Vec::new();
+    let mut actions = Vec::new();
+    for (index, declined) in model.declined.iter().enumerate() {
+        let selected = index == state.selected_declined;
+        let style = if selected {
+            Style::default()
+                .fg(Color::White)
+                .bg(Color::Rgb(20, 34, 45))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        lines.push(Line::styled(
+            clip_text(&declined.title, width.saturating_sub(1)),
+            style,
+        ));
+        actions.push(None);
+        lines.push(Line::from(vec![
+            Span::styled(
+                declined.outcome.clone(),
+                Style::default().fg(outcome_color(&declined.outcome)),
+            ),
+            Span::raw(" · "),
+            Span::styled(
+                age_from_seconds(declined.age_seconds),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        actions.push(None);
+        lines.push(Line::from(Span::styled(
+            "[ Promote ]",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        actions.push(Some(UiAction::PromoteDeclined(index)));
+        lines.push(hairline(width));
+        actions.push(None);
+    }
+    if let Some(notice) = &state.notice {
+        lines.push(Line::from(Span::styled(
+            clip_text(notice, width),
+            Style::default().fg(Color::Green),
+        )));
+        actions.push(None);
+    }
+    render_narrow_document(
+        frame,
+        body,
+        lines,
+        actions,
         Vec::new(),
         state.narrow_scroll,
         hit_regions,
@@ -1586,6 +1754,8 @@ fn tab_bar(model: &ArcUiViewModel, state: &InteractiveUiState) -> Paragraph<'sta
         Span::raw("  "),
         tab_span("3 Settings", state.tab == UiTab::Settings),
         Span::raw("   "),
+        tab_span("4 Declined", state.tab == UiTab::Declined),
+        Span::raw("   "),
         Span::styled(seam, Style::default().fg(Color::DarkGray)),
         Span::raw("   filter "),
         Span::styled(
@@ -1667,6 +1837,119 @@ fn draw_capsules_tab(
 
     let selected = model.capsules.get(state.selected_capsule);
     frame.render_widget(detail_pane(selected, state.expanded), body[1]);
+}
+
+fn draw_declined_tab(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &ArcUiViewModel,
+    state: &InteractiveUiState,
+    hit_regions: &mut Vec<HitRegion>,
+) {
+    let body = Layout::default()
+        .direction(if area.width >= 90 {
+            Direction::Horizontal
+        } else {
+            Direction::Vertical
+        })
+        .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
+        .split(area);
+    let list_width = body[0].width.saturating_sub(4).max(20) as usize;
+    let items = if model.declined.is_empty() {
+        vec![ListItem::new(Line::from(Span::styled(
+            "No declined drafts.",
+            Style::default().fg(Color::DarkGray),
+        )))]
+    } else {
+        model
+            .declined
+            .iter()
+            .map(|declined| {
+                ListItem::new(vec![
+                    Line::from(vec![
+                        Span::styled(
+                            declined.outcome.clone(),
+                            Style::default().fg(outcome_color(&declined.outcome)),
+                        ),
+                        Span::raw(" · "),
+                        Span::styled(
+                            age_from_seconds(declined.age_seconds),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]),
+                    Line::from(Span::styled(
+                        fit_words(&declined.title, list_width),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    )),
+                    Line::from(Span::styled(
+                        fit_words(&declined.reason, list_width),
+                        Style::default().fg(Color::DarkGray),
+                    )),
+                    Line::raw(""),
+                ])
+            })
+            .collect()
+    };
+    let mut list_state = ListState::default();
+    if !model.declined.is_empty() {
+        list_state.select(Some(state.selected_declined));
+    }
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(Block::default().title("Declined").borders(Borders::ALL))
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().bg(Color::Rgb(20, 34, 45))),
+        body[0],
+        &mut list_state,
+    );
+
+    let detail = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .split(body[1]);
+    let selected = model.declined.get(state.selected_declined);
+    let detail_text = selected.map_or_else(
+        || "Select a declined draft.".to_owned(),
+        |declined| {
+            format!(
+                "{}\n\n{}\n\nReason: {}\nSession: {}",
+                declined.title, declined.summary, declined.reason, declined.session_id
+            )
+        },
+    );
+    frame.render_widget(
+        Paragraph::new(detail_text)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Detail").borders(Borders::ALL)),
+        detail[0],
+    );
+    if selected.is_some() {
+        frame.render_widget(
+            Paragraph::new(" Promote ")
+                .alignment(ratatui::layout::Alignment::Center)
+                .style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .block(Block::default().borders(Borders::ALL)),
+            detail[1],
+        );
+        hit_regions.push(HitRegion {
+            area: detail[1],
+            action: UiAction::PromoteDeclined(state.selected_declined),
+        });
+    }
+}
+
+fn outcome_color(outcome: &str) -> Color {
+    match outcome {
+        "success" => Color::Green,
+        "failed" | "aborted" => Color::Red,
+        "partial" => Color::Yellow,
+        _ => Color::DarkGray,
+    }
 }
 
 fn capsule_item(capsule: &ArcUiCapsuleRow, width: u16) -> ListItem<'static> {
@@ -2088,7 +2371,11 @@ fn status_color(status: &str) -> Color {
 }
 
 fn event_color(kind: &str) -> Color {
-    if kind == "review.saved" || kind == "capsule.created" || kind == "capsule.finalized" {
+    if kind == "review.saved"
+        || kind == "capsule.created"
+        || kind == "capsule.finalized"
+        || kind == "capsule.promoted"
+    {
         Color::Green
     } else if kind == "privacy_updated"
         || kind == "capsule.privacy_updated"
@@ -2190,6 +2477,7 @@ pub(crate) struct ArcUiViewModel {
     query: String,
     capsules: Vec<ArcUiCapsuleRow>,
     selected_capsule: Option<ArcUiCapsuleRow>,
+    declined: Vec<DeclinedDraftView>,
     recent_events: Vec<ArcUiEventRow>,
 }
 
@@ -2200,6 +2488,7 @@ struct ArcUiStatus {
     workspace: String,
     cache_dir: String,
     capsule_count: usize,
+    declined_count: usize,
     event_count: usize,
     judge: ArcUiJudgeStatus,
     injection_pause: InjectionPauseStatus,
@@ -2263,6 +2552,7 @@ struct ArcUiEventRow {
 
 pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result<ArcUiViewModel> {
     let mut capsules = load_capsules(workspace)?;
+    let declined = load_declined_draft_views(workspace)?;
     let events = load_memory_events(workspace)?;
     let config = load_arc_config()?;
     let reachability = judge_reachability(&config);
@@ -2302,6 +2592,7 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
             workspace: workspace.to_string_lossy().to_string(),
             cache_dir: cache_dir(workspace).to_string_lossy().to_string(),
             capsule_count: capsules.len(),
+            declined_count: declined.len(),
             event_count: events.len(),
             judge: ArcUiJudgeStatus {
                 mode: config
@@ -2321,6 +2612,7 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
         query,
         capsules: rows,
         selected_capsule,
+        declined,
         recent_events,
     })
 }
@@ -2427,9 +2719,10 @@ pub(crate) fn render_status_summary(model: &ArcUiViewModel) -> String {
         "plugin pending"
     };
     format!(
-        "ARC {} | capsules: {} | events: {} | seam: {}{}",
+        "ARC {} | capsules: {} | declined: {} | events: {} | seam: {}{}",
         model.status.repo,
         model.status.capsule_count,
+        model.status.declined_count,
         model.status.event_count,
         seam,
         if model.status.injection_pause.paused {
@@ -2550,6 +2843,7 @@ mod tests {
                 workspace: "/tmp/tracer-ai".to_owned(),
                 cache_dir: "/tmp/tracer-ai/.agent-run-cache".to_owned(),
                 capsule_count: 1,
+                declined_count: 1,
                 event_count: 3,
                 judge: ArcUiJudgeStatus {
                     mode: "provider-judge".to_owned(),
@@ -2582,6 +2876,17 @@ mod tests {
             query: String::new(),
             capsules: vec![capsule.clone()],
             selected_capsule: Some(capsule),
+            declined: vec![DeclinedDraftView {
+                id: "declined-test".to_owned(),
+                merge_key: "draft:declined-test".to_owned(),
+                title: "Recover the declined verification route".to_owned(),
+                summary: "A completed command had reusable verification evidence.".to_owned(),
+                session_id: "declined-session".to_owned(),
+                outcome: "success".to_owned(),
+                reason: "reviewer considered this one-off".to_owned(),
+                created_at: Utc::now().to_rfc3339(),
+                age_seconds: 60,
+            }],
             recent_events: vec![ArcUiEventRow {
                 id: "event-test".to_owned(),
                 r#type: "capsule.injected".to_owned(),
@@ -2620,8 +2925,9 @@ mod tests {
         let text = terminal_text(&terminal);
         assert!(text.contains("arc · tracer-ai"));
         assert!(text.contains("capsules"));
+        assert!(text.contains("declined"));
         assert!(text.contains("injection"));
-        for row in 0..4 {
+        for row in 0..5 {
             assert!(hit_regions.iter().any(|region| {
                 matches!(
                     &region.action,
@@ -2707,6 +3013,12 @@ mod tests {
         assert!(matches!(
             handle_narrow_key(KeyCode::Enter, &model, &mut state).unwrap(),
             NarrowKeyOutcome::Action(UiAction::ToggleSection(DetailSection::ReuseWhen))
+        ));
+
+        state.narrow_screen = NarrowScreen::Declined;
+        assert!(matches!(
+            handle_narrow_key(KeyCode::Enter, &model, &mut state).unwrap(),
+            NarrowKeyOutcome::Action(UiAction::PromoteDeclined(0))
         ));
     }
 

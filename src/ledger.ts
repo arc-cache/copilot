@@ -13,6 +13,7 @@ export type MemoryEventType =
   | "capsule.related"
   | "capsule.superseded"
   | "capsule.rejected"
+  | "capsule.promoted"
   | "capsule.privacy_updated"
   | "capsule.checkpointed"
   | "capsule.finalized";
