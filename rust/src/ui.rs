@@ -7,8 +7,57 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
+use std::time::Instant;
 
 const NARROW_BREAKPOINT: u16 = 84;
+const RELOAD_THROTTLE: Duration = Duration::from_millis(500);
+const SLOW_FRAME_THRESHOLD: Duration = Duration::from_millis(100);
+const SLOW_FRAME_LOG_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Tracks view-model reload throttling. Pure logic (no I/O) so the decision
+/// can be unit-tested headlessly.
+struct ReloadThrottle {
+    interval: Duration,
+    last_reload: Option<Instant>,
+    force: bool,
+}
+
+impl ReloadThrottle {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            last_reload: None,
+            force: true,
+        }
+    }
+
+    fn force_reload(&mut self) {
+        self.force = true;
+    }
+
+    fn should_reload(&self, now: Instant) -> bool {
+        self.force
+            || self
+                .last_reload
+                .map_or(true, |last| now.duration_since(last) >= self.interval)
+    }
+
+    fn mark_reloaded(&mut self, now: Instant) {
+        self.last_reload = Some(now);
+        self.force = false;
+    }
+}
+
+/// Decide whether a slow frame warrants a debug ledger entry. Pure so it can
+/// be tested without touching the real debug ledger or wall-clock timers.
+fn should_log_slow_frame(
+    cycle_duration: Duration,
+    threshold: Duration,
+    since_last_log: Duration,
+    min_interval: Duration,
+) -> bool {
+    cycle_duration >= threshold && since_last_log >= min_interval
+}
 
 fn split_appliance_mode() -> bool {
     env::var("ARC_SPLIT_APPLIANCE")
@@ -79,13 +128,36 @@ fn run_ui_loop(
     let mut state = InteractiveUiState::default();
     let mut hit_regions = Vec::new();
     let mut last_area = Rect::default();
-    loop {
+    let mut throttle = ReloadThrottle::new(RELOAD_THROTTLE);
+    let mut last_slow_frame_log = Instant::now()
+        .checked_sub(SLOW_FRAME_LOG_INTERVAL)
+        .unwrap_or_else(Instant::now);
+
+    // Initial load — model is cached and only reloaded on the throttle.
+    let mut model = {
         let options = UiOptions {
             query: state.filter.clone(),
             selected_id: None,
             event_limit: Some(160),
         };
-        let model = load_ui_view_model(workspace, options)?;
+        load_ui_view_model(workspace, options)?
+    };
+    throttle.mark_reloaded(Instant::now());
+
+    loop {
+        let cycle_start = Instant::now();
+
+        // Throttled reload: at most once per RELOAD_THROTTLE, or immediately
+        // after a mutating action flagged via throttle.force_reload().
+        if throttle.should_reload(cycle_start) {
+            let options = UiOptions {
+                query: state.filter.clone(),
+                selected_id: None,
+                event_limit: Some(160),
+            };
+            model = load_ui_view_model(workspace, options)?;
+            throttle.mark_reloaded(Instant::now());
+        }
         state.clamp(&model);
         if (state.tab == UiTab::Settings || state.narrow_screen == NarrowScreen::Judge)
             && state.judge_models.is_empty()
@@ -99,16 +171,40 @@ fn run_ui_loop(
             draw_ui_frame(frame, &model, &state, &mut hit_regions);
         })?;
         if !event::poll(Duration::from_millis(250))? {
+            let elapsed = cycle_start.elapsed();
+            if should_log_slow_frame(
+                elapsed,
+                SLOW_FRAME_THRESHOLD,
+                cycle_start.duration_since(last_slow_frame_log),
+                SLOW_FRAME_LOG_INTERVAL,
+            ) {
+                debug(
+                    workspace,
+                    "ui.slow_frame",
+                    json!({ "elapsed_ms": elapsed.as_millis() as u64 }),
+                )?;
+                last_slow_frame_log = Instant::now();
+            }
             continue;
         }
-        match event::read()? {
+
+        // Coalesce: drain all pending events before redrawing. A mouse wheel
+        // burst emits dozens of events; without coalescing each one triggers a
+        // full disk reload + redraw, freezing the pane for 1–2 seconds.
+        let mut should_close = false;
+        loop {
+            match event::read()? {
             Event::Key(key) => {
                 if state.appliance || last_area.width < NARROW_BREAKPOINT {
                     match handle_narrow_key(key.code, &model, &mut state)? {
-                        NarrowKeyOutcome::Close => break,
+                        NarrowKeyOutcome::Close => {
+                            should_close = true;
+                            break;
+                        }
                         NarrowKeyOutcome::Continue => {}
                         NarrowKeyOutcome::Action(action) => {
                             handle_ui_action(action, &model, &mut state, workspace, terminal)?;
+                            throttle.force_reload();
                         }
                     }
                     continue;
@@ -120,17 +216,22 @@ fn run_ui_loop(
                         KeyCode::Backspace => {
                             state.filter.pop();
                             state.selected_capsule = 0;
+                            throttle.force_reload();
                         }
                         KeyCode::Char(value) => {
                             state.filter.push(value);
                             state.selected_capsule = 0;
+                            throttle.force_reload();
                         }
                         _ => {}
                     }
                     continue;
                 }
                 match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Char('q') | KeyCode::Esc => {
+                        should_close = true;
+                        break;
+                    }
                     KeyCode::Tab => state.next_tab(),
                     KeyCode::BackTab => state.previous_tab(),
                     KeyCode::Char('1') => state.tab = UiTab::Capsules,
@@ -144,6 +245,7 @@ fn run_ui_loop(
                     KeyCode::Char('/') => {
                         state.tab = UiTab::Capsules;
                         state.filter_editing = true;
+                        throttle.force_reload();
                     }
                     KeyCode::Char('r') => {
                         if state.tab == UiTab::Settings {
@@ -156,6 +258,7 @@ fn run_ui_loop(
                     KeyCode::Enter => {
                         if state.tab == UiTab::Settings {
                             apply_settings_selection(&mut state)?;
+                            throttle.force_reload();
                         } else if state.tab == UiTab::Declined && !model.declined.is_empty() {
                             handle_ui_action(
                                 UiAction::PromoteDeclined(state.selected_declined),
@@ -164,15 +267,18 @@ fn run_ui_loop(
                                 workspace,
                                 terminal,
                             )?;
+                            throttle.force_reload();
                         } else {
                             state.expanded = !state.expanded;
                         }
                     }
                     KeyCode::Left if state.tab == UiTab::Settings => {
                         adjust_settings_selection(&mut state, -1)?;
+                        throttle.force_reload();
                     }
                     KeyCode::Right if state.tab == UiTab::Settings => {
                         adjust_settings_selection(&mut state, 1)?;
+                        throttle.force_reload();
                     }
                     _ => {}
                 }
@@ -198,6 +304,7 @@ fn run_ui_loop(
                         .map(|region| region.action.clone())
                     {
                         handle_ui_action(action, &model, &mut state, workspace, terminal)?;
+                        throttle.force_reload();
                     } else if mouse.row <= 3 {
                         state.tab = if mouse.column > 43 {
                             UiTab::Declined
@@ -223,6 +330,28 @@ fn run_ui_loop(
             },
             Event::Resize(_, _) => {}
             _ => {}
+            }
+            if should_close || !event::poll(Duration::from_millis(0))? {
+                break;
+            }
+        }
+        if should_close {
+            break;
+        }
+
+        let elapsed = cycle_start.elapsed();
+        if should_log_slow_frame(
+            elapsed,
+            SLOW_FRAME_THRESHOLD,
+            cycle_start.duration_since(last_slow_frame_log),
+            SLOW_FRAME_LOG_INTERVAL,
+        ) {
+            debug(
+                workspace,
+                "ui.slow_frame",
+                json!({ "elapsed_ms": elapsed.as_millis() as u64 }),
+            )?;
+            last_slow_frame_log = Instant::now();
         }
     }
     Ok(())
@@ -3064,5 +3193,103 @@ mod tests {
         assert!(!hit_regions
             .iter()
             .any(|region| matches!(&region.action, UiAction::ToggleZoom)));
+    }
+
+    // WS2: ReloadThrottle — reload is forced on first call, then throttled.
+    #[test]
+    fn reload_throttle_forces_first_reload() {
+        let mut throttle = ReloadThrottle::new(Duration::from_millis(500));
+        let now = Instant::now();
+        assert!(
+            throttle.should_reload(now),
+            "first cycle must always reload"
+        );
+        throttle.mark_reloaded(now);
+        assert!(
+            !throttle.should_reload(now),
+            "immediately after reload, should not reload again"
+        );
+    }
+
+    #[test]
+    fn reload_throttle_reloads_after_interval() {
+        let interval = Duration::from_millis(500);
+        let mut throttle = ReloadThrottle::new(interval);
+        let t0 = Instant::now();
+        throttle.mark_reloaded(t0);
+
+        assert!(!throttle.should_reload(t0 + Duration::from_millis(499)));
+        assert!(
+            throttle.should_reload(t0 + Duration::from_millis(500)),
+            "reload must fire once the throttle interval has elapsed"
+        );
+    }
+
+    #[test]
+    fn reload_throttle_force_bypasses_interval() {
+        let mut throttle = ReloadThrottle::new(Duration::from_millis(500));
+        let t0 = Instant::now();
+        throttle.mark_reloaded(t0);
+
+        assert!(!throttle.should_reload(t0));
+        throttle.force_reload();
+        assert!(
+            throttle.should_reload(t0),
+            "force_reload must bypass the throttle interval"
+        );
+        throttle.mark_reloaded(t0);
+        assert!(
+            !throttle.should_reload(t0),
+            "mark_reloaded must clear the force flag"
+        );
+    }
+
+    // WS2: should_log_slow_frame — only logs above threshold and rate-limited.
+    #[test]
+    fn slow_frame_logs_above_threshold_and_rate_limit() {
+        let threshold = Duration::from_millis(100);
+        let min_interval = Duration::from_secs(60);
+
+        assert!(
+            should_log_slow_frame(
+                Duration::from_millis(150),
+                threshold,
+                Duration::from_secs(61),
+                min_interval,
+            ),
+            "slow cycle past threshold and rate limit should log"
+        );
+    }
+
+    #[test]
+    fn slow_frame_skips_below_threshold() {
+        let threshold = Duration::from_millis(100);
+        let min_interval = Duration::from_secs(60);
+
+        assert!(
+            !should_log_slow_frame(
+                Duration::from_millis(80),
+                threshold,
+                Duration::from_secs(120),
+                min_interval,
+            ),
+            "fast cycle must not log even if rate limit is satisfied"
+        );
+    }
+
+    #[test]
+    fn slow_frame_respects_rate_limit() {
+        let threshold = Duration::from_millis(100);
+        let min_interval = Duration::from_secs(60);
+
+        assert!(
+            !should_log_slow_frame(
+                Duration::from_millis(200),
+                threshold,
+                Duration::from_millis(30),
+                min_interval,
+            ),
+            "must not spam: a slow frame within the rate-limit window is suppressed"
+        );
     }
 }
