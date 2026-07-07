@@ -1,0 +1,3 @@
+{"id": "sc-session-start", "runner": "copilot", "sessionId": "sidecar-marker-session", "workspace": "", "timestamp": "2026-01-01T00:00:00.000Z", "type": "session_start", "source": "copilot-transcript"}
+{"id": "sc-system", "runner": "copilot", "sessionId": "sidecar-marker-session", "workspace": "", "timestamp": "2026-01-01T00:00:01.000Z", "type": "user_prompt", "source": "copilot-transcript", "text": "You are the Agent Run Cache sidecar. Review the following session events and decide whether to save a capsule."}
+{"id": "sc-assistant", "runner": "copilot", "sessionId": "sidecar-marker-session", "workspace": "", "timestamp": "2026-01-01T00:00:02.000Z", "type": "assistant_message", "source": "copilot-transcript", "text": "I have reviewed the session events."}
