@@ -1402,7 +1402,7 @@ fn draw_narrow_capsule_detail(
             Line::from(vec![
                 Span::styled("‹ back", Style::default().fg(Color::Cyan)),
                 Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled("share", Style::default().fg(Color::Cyan)),
+                Span::styled("copy", Style::default().fg(Color::Cyan)),
             ])
         } else {
             Line::from(vec![
@@ -1410,7 +1410,7 @@ fn draw_narrow_capsule_detail(
                 Span::styled(" · ", Style::default().fg(Color::DarkGray)),
                 Span::styled("⤢ full", Style::default().fg(Color::Cyan)),
                 Span::styled(" · ", Style::default().fg(Color::DarkGray)),
-                Span::styled("share", Style::default().fg(Color::Cyan)),
+                Span::styled("copy", Style::default().fg(Color::Cyan)),
             ])
         };
         frame.render_widget(Paragraph::new(vec![hairline(width), footer_line]), footer);
@@ -1425,13 +1425,13 @@ fn draw_narrow_capsule_detail(
                     action: UiAction::ToggleZoom,
                 });
             }
-            let share_x = if state.appliance { 9 } else { 18 };
-            if footer.width > share_x {
+            let copy_x = if state.appliance { 9 } else { 18 };
+            if footer.width > copy_x {
                 hit_regions.push(HitRegion {
                     area: Rect::new(
-                        footer.x + share_x,
+                        footer.x + copy_x,
                         footer.y + 1,
-                        footer.width.saturating_sub(share_x),
+                        footer.width.saturating_sub(copy_x),
                         1,
                     ),
                     action: UiAction::ShareCapsule,
@@ -3091,7 +3091,7 @@ mod tests {
             "validation",
             "dead ends",
             "full",
-            "share",
+            "copy",
         ] {
             assert!(text.contains(label), "missing {label} in:\n{text}");
         }
@@ -3188,7 +3188,7 @@ mod tests {
             .draw(|frame| draw_ui_frame(frame, &model, &state, &mut hit_regions))
             .unwrap();
         let text = terminal_text(&terminal);
-        assert!(text.contains("‹ back · share"));
+        assert!(text.contains("‹ back · copy"));
         assert!(!text.contains("full"));
         assert!(!hit_regions
             .iter()
