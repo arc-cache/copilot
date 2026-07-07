@@ -51,6 +51,40 @@ Run from a clean checkout on `main`.
    `release/` (`arc-<version>-<target>.tar.gz` and the Windows `.zip`). The
    installer scripts resolve the latest tag and expect exactly these asset names.
 
+## Before npm publish — mandatory smoke gate
+
+Do not publish until every item below is green. The automated block runs in
+under a minute on a modern laptop; the manual block takes about five minutes
+on a real repo.
+
+### Automated
+
+```bash
+npm test                           # 44 JS tests
+cargo test                         # unit + parity + WS3 replay fixtures
+npm run verify:rust-local-embeddings  # local embedder + long-prompt probe
+```
+
+All three must pass with zero failures. The replay suite
+(`cargo test --test rust_parity -- replay`) covers long-prompt noise,
+multi-goal sessions, aborted commands, and sidecar-marker skipping.
+
+### Manual (5 minutes, on a real repo)
+
+- [ ] `arc split` opens with a responsive ARC pane (scroll and keyboard are
+      smooth, no 1–2 s freeze on input bursts)
+- [ ] Prompt Copilot with a pasted-log prompt (paste >100 lines of build or
+      server logs into the prompt)
+- [ ] Exit Copilot (Ctrl+q or `/exit`) — split closes cleanly with no shell hang
+- [ ] `arc capsules --json` shows the harvested session
+- [ ] `arc events --json` shows the trace and review events
+- [ ] `arc doctor --json` shows `embedder.ok: true` and `judge.reachable: true`
+- [ ] `copilot --resume` shows **no** ARC sidecar entries (no sessions titled
+      "You are the Agent Run Cache sidecar…")
+
+If any manual item fails, do not publish — fix the issue and re-run the full
+gate from the top.
+
 ## Verifying an install
 
 ```bash
