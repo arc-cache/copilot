@@ -3226,6 +3226,7 @@ fn run_shell_command(command: &str, input: &str) -> Result<String> {
         &["-lc".to_owned(), command.to_owned()],
         env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         input,
+        &[],
     )
 }
 
@@ -3270,6 +3271,7 @@ fn run_model_sidecar(prompt: &str, workspace: &Path, runner: &str) -> Result<Str
             &["run".to_owned(), prompt.to_owned()],
             workspace.to_path_buf(),
             "",
+            &[],
         ),
         "copilot" => run_copilot_sidecar(prompt, workspace, None),
         other => Err(anyhow!("unsupported model sidecar runner: {other}")),
@@ -3341,7 +3343,25 @@ fn run_copilot_sidecar(prompt: &str, workspace: &Path, model: Option<&str>) -> R
         args.push(model.to_owned());
     }
     let (command, args) = copilot_sidecar_command(args)?;
-    let output = run_process_capture(&command, &args, workspace.to_path_buf(), "")?;
+
+    // Redirect the sidecar's COPILOT_HOME so its session-state lands in an
+    // ARC-managed dir, invisible to the user's `copilot --resume`.
+    let home = sidecar_copilot_home();
+    fs::create_dir_all(&home)?;
+    let home_str = home.to_str().unwrap_or("");
+    let output = run_process_capture(
+        &command,
+        &args,
+        workspace.to_path_buf(),
+        "",
+        &[("COPILOT_HOME", home_str)],
+    )?;
+    // The sidecar is done — its session-state in the sidecar home is no longer
+    // needed. Remove it to prevent unbounded growth.
+    cleanup_sidecar_home(&home)?;
+    // Safety net: sweep any ARC sidecar sessions left in the user's real
+    // Copilot state dir (from before this fix or any bypass path).
+    cleanup_arc_sidecar_sessions(workspace)?;
     Ok(copilot_json_output_content(&output).unwrap_or(output))
 }
 
@@ -3463,14 +3483,19 @@ fn run_process_capture(
     args: &[String],
     cwd: PathBuf,
     input: &str,
+    extra_env: &[(&str, &str)],
 ) -> Result<String> {
-    let mut child = Command::new(command)
-        .args(args)
+    let mut cmd = Command::new(command);
+    cmd.args(args)
         .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .env("AGENT_RUN_CACHE_IN_SIDECAR", "1")
+        .env("AGENT_RUN_CACHE_IN_SIDECAR", "1");
+    for (key, value) in extra_env {
+        cmd.env(key, value);
+    }
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("failed to run sidecar command: {command}"))?;
     if let Some(stdin) = child.stdin.as_mut() {
@@ -3512,18 +3537,120 @@ fn trace_hash(events: &[ArcEvent]) -> String {
     hex::encode(hash.finalize())
 }
 
+const SIDECAR_MARKERS: &[&str] = &[
+    "You are the Agent Run Cache sidecar",
+    "You are the Agent Run Cache consulting sidecar",
+    "You are the live Agent Run Cache observer sidecar",
+];
+
 fn is_arc_sidecar_session(events: &[ArcEvent]) -> bool {
-    let markers = [
-        "You are the Agent Run Cache sidecar",
-        "You are the Agent Run Cache consulting sidecar",
-        "You are the live Agent Run Cache observer sidecar",
-    ];
     events.iter().any(|event| {
         event
             .text
             .as_deref()
-            .is_some_and(|text| markers.iter().any(|marker| text.contains(marker)))
+            .is_some_and(|text| SIDECAR_MARKERS.iter().any(|marker| text.contains(marker)))
     })
+}
+
+/// Check whether a raw Copilot events.jsonl file contains an ARC sidecar
+/// marker prompt. Reads line by line and returns as soon as a marker is found.
+fn session_has_sidecar_marker(events_path: &Path) -> bool {
+    let Ok(file) = fs::File::open(events_path) else {
+        return false;
+    };
+    for line in io::BufRead::lines(io::BufReader::new(file)) {
+        let Ok(line) = line else { break };
+        if SIDECAR_MARKERS.iter().any(|marker| line.contains(marker)) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The COPILOT_HOME used for ARC sidecar invocations. Redirecting the home
+/// prevents sidecar sessions from landing in the user's real Copilot history
+/// (and therefore appearing in `copilot --resume`). Auth material lives in the
+/// OS keychain, so a fresh home does not break authentication.
+fn sidecar_copilot_home() -> PathBuf {
+    env::var("AGENT_RUN_CACHE_SIDECAR_COPILOT_HOME")
+        .map(PathBuf::from)
+        .map(absolutize)
+        .unwrap_or_else(|_| arc_home().join("copilot-sidecar-home"))
+}
+
+/// Remove all session-state dirs from the ARC-managed sidecar home after a
+/// sidecar completes. The sidecar home only contains ARC's own ephemeral
+/// sessions, so wholesale removal is safe and prevents unbounded growth.
+fn cleanup_sidecar_home(home: &Path) -> Result<()> {
+    let state_dir = home.join("session-state");
+    let entries = match fs::read_dir(&state_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let _ = fs::remove_dir_all(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Sweep the user's real Copilot session-state dir for leftover ARC sidecar
+/// sessions (from before the redirected-home fix, or from any path that
+/// bypasses it). Only deletes sessions whose events.jsonl contains a sidecar
+/// marker. Sessions that cannot be removed — e.g. in use by a concurrent
+/// Copilot process — are skipped, never fatal.
+fn cleanup_arc_sidecar_sessions(workspace: &Path) -> Result<()> {
+    cleanup_sidecar_sessions_in_dir(&copilot_state_dir(), workspace)
+}
+
+/// Core cleanup logic, parameterized by the session-state root so it can be
+/// tested without touching the real Copilot home or process-global env vars.
+fn cleanup_sidecar_sessions_in_dir(state_dir: &Path, workspace: &Path) -> Result<()> {
+    let entries = match fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok(()),
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let events_path = path.join("events.jsonl");
+        if !events_path.exists() {
+            continue;
+        }
+        if !session_has_sidecar_marker(&events_path) {
+            continue;
+        }
+        match fs::remove_dir_all(&path) {
+            Ok(()) => {
+                removed += 1;
+                debug(
+                    workspace,
+                    "sidecar.session_cleaned",
+                    json!({ "dir": path }),
+                )?;
+            }
+            Err(err) => {
+                debug(
+                    workspace,
+                    "sidecar.session_cleanup_skipped",
+                    json!({ "dir": path, "error": err.to_string() }),
+                )?;
+            }
+        }
+    }
+    if removed > 0 {
+        debug(
+            workspace,
+            "sidecar.pollution_cleanup",
+            json!({ "removed": removed }),
+        )?;
+    }
+    Ok(())
 }
 
 fn is_stored_arc_event(raw: &Value) -> bool {
@@ -4043,5 +4170,98 @@ mod split_harvest_tests {
         assert!(prompt.contains(
             "Decline only when nothing in the evidence could help a future similar session"
         ));
+    }
+
+    // WS1 regression: cleanup_arc_sidecar_sessions must remove ARC sidecar
+    // sessions from the user's Copilot state dir while leaving real user
+    // sessions untouched. Uses a fake state dir (AGENT_RUN_CACHE_COPILOT_STATE_DIR
+    // + tempdir), same pattern as the split-harvest test above.
+    #[test]
+    fn cleanup_removes_sidecar_sessions_but_preserves_user_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("copilot-state");
+
+        // Sidecar session — contains an ARC sidecar marker in events.jsonl.
+        let sidecar_id = "sidecar-pollution-1";
+        let sidecar_dir = state_dir.join(sidecar_id);
+        fs::create_dir_all(&sidecar_dir).unwrap();
+        fs::write(
+            sidecar_dir.join("events.jsonl"),
+            "{\"type\":\"system.message\",\"data\":{\"role\":\"system\",\"content\":\"You are the Agent Run Cache sidecar. Review the session events.\"}}\n",
+        )
+        .unwrap();
+
+        // Real user session — no sidecar marker.
+        let user_id = "user-real-session-1";
+        let user_dir = state_dir.join(user_id);
+        fs::create_dir_all(&user_dir).unwrap();
+        fs::write(
+            user_dir.join("events.jsonl"),
+            "{\"sessionId\":\"user-real-session-1\",\"type\":\"prompt\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":\"copilot-transcript\",\"text\":\"fix the login bug\"}\n",
+        )
+        .unwrap();
+
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Call the dir-parameterized core directly to avoid racing on the
+        // process-global AGENT_RUN_CACHE_COPILOT_STATE_DIR env var.
+        cleanup_sidecar_sessions_in_dir(&state_dir, &workspace).unwrap();
+
+        // Sidecar session is gone.
+        assert!(
+            !sidecar_dir.exists(),
+            "sidecar session-state dir should be removed"
+        );
+        // User session is untouched.
+        assert!(
+            user_dir.exists(),
+            "user session-state dir must be preserved"
+        );
+        assert!(
+            user_dir.join("events.jsonl").exists(),
+            "user events.jsonl must be preserved"
+        );
+    }
+
+    #[test]
+    fn cleanup_does_not_touch_sessions_without_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let state_dir = tmp.path().join("copilot-state");
+
+        // Two user sessions, neither with a marker.
+        for id in ["user-a", "user-b"] {
+            let dir = state_dir.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("events.jsonl"),
+                format!(
+                    "{{\"sessionId\":\"{id}\",\"type\":\"prompt\",\"timestamp\":\"2026-01-01T00:00:00.000Z\",\"source\":\"copilot-transcript\",\"text\":\"real user work\"}}\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        cleanup_sidecar_sessions_in_dir(&state_dir, &workspace).unwrap();
+
+        for id in ["user-a", "user-b"] {
+            assert!(
+                state_dir.join(id).exists(),
+                "non-sidecar session {id} must not be touched"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_tolerates_missing_state_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        // Pass a dir that does not exist — must not error.
+        cleanup_sidecar_sessions_in_dir(&tmp.path().join("nonexistent"), &workspace).unwrap();
     }
 }
