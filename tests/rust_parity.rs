@@ -1256,6 +1256,335 @@ if (!saved) throw new Error("seed save failed");
     );
 }
 
+// ---------------------------------------------------------------------------
+// WS3: real-run replay regression fixtures.
+//
+// These tests drive the built Rust binary end-to-end on synthesized traces
+// shaped like real Copilot sessions. They run fully offline: no live embedder
+// (AGENT_RUN_CACHE_LOCAL_EMBEDDINGS=off, no endpoint), no network, and the
+// reviewer sidecar is either off or stubbed via AGENT_RUN_CACHE_REVIEWER_COMMAND
+// pointing at a local script.
+// ---------------------------------------------------------------------------
+
+fn fixture_path(name: &str) -> PathBuf {
+    repo_root().join("test/fixtures").join(name)
+}
+
+/// A minimal reviewer script that saves a capsule for any input it receives.
+/// Used when a test needs the review path to produce a capsule.
+fn write_replay_reviewer(dir: &Path) -> PathBuf {
+    let reviewer = dir.join("replay-reviewer.cjs");
+    fs::write(
+        &reviewer,
+        r#"
+process.stdin.resume();
+process.stdin.on("data", () => {});
+process.stdin.on("end", () => {
+  process.stdout.write(JSON.stringify({
+    shouldSave: true,
+    capsules: [{
+      id: "replay-fixture-capsule",
+      title: "Replay fixture capsule",
+      kind: "workflow",
+      mergeKey: "replay.fixture",
+      summary: "A capsule created from a replay fixture trace.",
+      reusable: true,
+      confidence: 0.8,
+      reuseWhen: ["replaying a fixture trace"],
+      doNotReuseWhen: [],
+      evidence: ["The fixture trace was imported and reviewed offline."],
+      provenance: ["tests/rust_parity.rs"],
+      artifactSources: [],
+      supersedes: [],
+      confidenceReason: "The reviewer command was called with the assembled draft.",
+      failureBoundary: ["Offline fixture replay only."],
+      validationProvenance: ["cargo test replay fixtures"],
+      nextRunInstruction: "Run arc import-copilot with the fixture file.",
+      workflow: {
+        purpose: "Verify ARC replay fixture handling.",
+        parameters: ["events.jsonl"],
+        bindingSources: ["tests/rust_parity.rs"],
+        steps: ["Import the fixture trace.", "Review with a stubbed reviewer.", "Assert capsule saved."],
+        commands: ["arc import-copilot <events.jsonl>"],
+        successCriteria: ["reviewed.jsonl records status saved"],
+        failedAttempts: [],
+        validationProbe: ["arc capsules --json"]
+      }
+    }]
+  }));
+});
+"#,
+    )
+    .unwrap();
+    reviewer
+}
+
+/// Read all reviewed.jsonl entries as a Vec<Value>.
+fn read_all_reviewed(workspace: &Path) -> Vec<Value> {
+    let path = workspace.join(".agent-run-cache/reviewed.jsonl");
+    if !path.exists() {
+        return Vec::new();
+    }
+    fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect()
+}
+
+/// Check if a trace file exists for the given session ID.
+fn trace_exists(workspace: &Path, session_id: &str) -> bool {
+    workspace
+        .join(".agent-run-cache/traces")
+        .join(format!("arc-{session_id}.jsonl"))
+        .exists()
+}
+
+#[test]
+fn replay_long_prompt_with_pasted_log_noise_imports_without_crash() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let fixture = fixture_path("long-prompt-noise.jsonl");
+    assert!(fixture.exists(), "fixture file must exist: {}", fixture.display());
+
+    // Fully offline: no embedder, no reviewer, no model sidecar.
+    let output = run_rust_raw(
+        &["import-copilot", fixture.to_str().unwrap()],
+        &workspace,
+        None,
+        &[],
+    );
+
+    // The import must succeed despite the very long prompt (>512 tokens of
+    // pasted log noise). This reproduces the evidence-starvation class of bugs
+    // where long prompts caused issues in the capture/review pipeline.
+    assert!(
+        output.contains("imported and reviewed"),
+        "import must succeed: {output}"
+    );
+    assert!(
+        trace_exists(&workspace, "long-prompt-session"),
+        "trace must be saved for the long-prompt session"
+    );
+
+    // With no reviewer and model sidecar off, the review outcome is no_capsule.
+    let reviewed = read_all_reviewed(&workspace);
+    assert!(!reviewed.is_empty(), "a reviewed.jsonl entry must exist");
+    let entry = &reviewed[0];
+    assert_eq!(
+        entry["sessionId"], "long-prompt-session",
+        "reviewed entry must reference the correct session"
+    );
+}
+
+#[test]
+fn replay_multi_goal_session_reviews_with_stubbed_reviewer() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let fixture = fixture_path("multi-goal-session.jsonl");
+    assert!(fixture.exists());
+
+    let reviewer = write_replay_reviewer(root.path());
+    let reviewer_command = format!(
+        "{} {}",
+        std::env::var("NODE").unwrap_or_else(|_| "node".to_owned()),
+        reviewer.display()
+    );
+    let env = [("AGENT_RUN_CACHE_REVIEWER_COMMAND", reviewer_command.as_str())];
+
+    let output = run_rust_raw(
+        &["import-copilot", fixture.to_str().unwrap()],
+        &workspace,
+        None,
+        &env,
+    );
+    assert!(
+        output.contains("imported and reviewed 9 events"),
+        "all 9 events from the multi-goal session must be imported: {output}"
+    );
+    assert!(
+        trace_exists(&workspace, "multi-goal-session"),
+        "trace must be saved for the multi-goal session"
+    );
+
+    let reviewed = read_all_reviewed(&workspace);
+    assert!(!reviewed.is_empty());
+    assert_eq!(
+        reviewed[0]["status"], "saved",
+        "reviewer must save a capsule for the multi-goal session"
+    );
+
+    let capsules = run_rust_json(&["capsules", "--json"], &workspace, None);
+    assert_eq!(
+        capsules["capsules"].as_array().unwrap().len(),
+        1,
+        "exactly one capsule must be saved"
+    );
+    assert_eq!(
+        capsules["capsules"][0]["sourceSessionId"],
+        "multi-goal-session"
+    );
+}
+
+#[test]
+fn replay_aborted_command_records_no_capsule_and_no_false_success() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let fixture = fixture_path("aborted-command.jsonl");
+    assert!(fixture.exists());
+
+    // Fully offline: no reviewer, no model sidecar.
+    let output = run_rust_raw(
+        &["import-copilot", fixture.to_str().unwrap()],
+        &workspace,
+        None,
+        &[],
+    );
+    assert!(
+        output.contains("imported and reviewed"),
+        "import must succeed even with an aborted command: {output}"
+    );
+    assert!(
+        trace_exists(&workspace, "aborted-command-session"),
+        "trace must be saved for the aborted-command session"
+    );
+
+    // The session has a tool_start with no matching tool_end — no success
+    // evidence. The review must not fabricate a capsule.
+    let capsules = run_rust_json(&["capsules", "--json"], &workspace, None);
+    assert_eq!(
+        capsules["capsules"].as_array().unwrap().len(),
+        0,
+        "no capsule must be saved for a session with an aborted command and no completion result"
+    );
+
+    let reviewed = read_all_reviewed(&workspace);
+    assert!(!reviewed.is_empty());
+    // The status must reflect that no capsule was saved — not "saved".
+    assert_ne!(
+        reviewed[0]["status"], "saved",
+        "an aborted command with no completion must not produce a saved capsule"
+    );
+}
+
+#[test]
+fn replay_sidecar_marker_session_is_skipped_during_harvest() {
+    let root = tempfile::tempdir().unwrap();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+
+    // Set up a fake Copilot session-state dir with two sessions:
+    // 1. A sidecar-marker session (should be skipped during harvest)
+    // 2. A real user session (should be harvested)
+    let state_dir = root.path().join("copilot-state");
+
+    let sidecar_dir = state_dir.join("sidecar-marker-session");
+    fs::create_dir_all(&sidecar_dir).unwrap();
+    fs::copy(
+        fixture_path("sidecar-marker.jsonl"),
+        sidecar_dir.join("events.jsonl"),
+    )
+    .unwrap();
+
+    let user_dir = state_dir.join("user-real-session");
+    fs::create_dir_all(&user_dir).unwrap();
+    fs::copy(
+        fixture_path("user-real-session.jsonl"),
+        user_dir.join("events.jsonl"),
+    )
+    .unwrap();
+
+    let env = [(
+        "AGENT_RUN_CACHE_COPILOT_STATE_DIR",
+        state_dir.to_str().unwrap(),
+    )];
+
+    // harvest --latest should skip the sidecar session and harvest the user session.
+    let output = run_rust_raw(
+        &["harvest", "--latest"],
+        &workspace,
+        None,
+        &env,
+    );
+
+    // The user session must be the one harvested (it is newer alphabetically
+    // but mtime-based ordering means whichever was created last; we set up
+    // the user session second so it has a newer mtime).
+    assert!(
+        output.contains("harvested user-real-session")
+            || output.contains("no unharvested session found"),
+        "harvest should find the user session, not the sidecar: {output}"
+    );
+
+    // The sidecar session must NOT have a trace saved.
+    assert!(
+        !trace_exists(&workspace, "sidecar-marker-session"),
+        "sidecar-marker session must not be harvested into a trace"
+    );
+
+    // If a session was harvested, it must be the user session.
+    if output.contains("harvested") {
+        assert!(
+            trace_exists(&workspace, "user-real-session"),
+            "user session must be harvested into a trace"
+        );
+    }
+}
+
+#[test]
+fn replay_sidecar_marker_session_is_skipped_during_import() {
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let fixture = fixture_path("sidecar-marker.jsonl");
+    assert!(fixture.exists());
+
+    let output = run_rust_raw(
+        &["import-copilot", fixture.to_str().unwrap()],
+        &workspace,
+        None,
+        &[],
+    );
+
+    // The import succeeds (events are read and saved as a trace), but the
+    // review must be skipped because the session contains a sidecar marker.
+    assert!(
+        output.contains("imported and reviewed"),
+        "import must succeed: {output}"
+    );
+
+    // The review skip is recorded in the debug ledger, not in reviewed.jsonl
+    // (sidecar sessions are skipped before record_review is called).
+    let debug_path = workspace.join(".agent-run-cache/debug/runtime.jsonl");
+    assert!(debug_path.exists(), "debug ledger must exist");
+    let debug_content = fs::read_to_string(&debug_path).unwrap();
+    assert!(
+        debug_content.contains("review.skipped"),
+        "debug ledger must record the review skip"
+    );
+    assert!(
+        debug_content.contains("arc sidecar session"),
+        "skip reason must be truthful: {debug_content}"
+    );
+
+    // No reviewed.jsonl entry should exist (the skip happens before recording).
+    let reviewed = read_all_reviewed(&workspace);
+    assert!(
+        reviewed.is_empty(),
+        "no reviewed.jsonl entry should exist for a skipped sidecar session"
+    );
+
+    // No capsule must be saved.
+    let capsules = run_rust_json(&["capsules", "--json"], &workspace, None);
+    assert_eq!(
+        capsules["capsules"].as_array().unwrap().len(),
+        0,
+        "no capsule must be saved for a sidecar-marker session"
+    );
+}
+
+
 fn write_capture_trace(path: &Path) {
     let events = [
         serde_json::json!({
