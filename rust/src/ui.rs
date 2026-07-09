@@ -7,7 +7,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::time::Instant;
+use std::{sync::mpsc, thread, time::Instant};
 
 const NARROW_BREAKPOINT: u16 = 84;
 const RELOAD_THROTTLE: Duration = Duration::from_millis(500);
@@ -63,6 +63,84 @@ fn split_appliance_mode() -> bool {
     env::var("ARC_SPLIT_APPLIANCE")
         .map(|value| value != "0" && value != "off")
         .unwrap_or(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalInputMode {
+    Polled,
+    BlockingReader,
+}
+
+fn terminal_input_mode(appliance: bool) -> TerminalInputMode {
+    if appliance {
+        TerminalInputMode::BlockingReader
+    } else {
+        TerminalInputMode::Polled
+    }
+}
+
+enum UiEventSource {
+    Polled,
+    BlockingReader(mpsc::Receiver<Result<crossterm::event::Event, String>>),
+}
+
+impl UiEventSource {
+    fn new(mode: TerminalInputMode) -> Self {
+        match mode {
+            TerminalInputMode::Polled => Self::Polled,
+            TerminalInputMode::BlockingReader => {
+                let (sender, receiver) = mpsc::channel();
+                thread::spawn(move || loop {
+                    let result = crossterm::event::read().map_err(|error| error.to_string());
+                    let should_continue = result.is_ok();
+                    if sender.send(result).is_err() || !should_continue {
+                        break;
+                    }
+                });
+                Self::BlockingReader(receiver)
+            }
+        }
+    }
+
+    fn wait(&mut self, timeout: Duration) -> Result<Option<crossterm::event::Event>> {
+        match self {
+            Self::Polled => {
+                if crossterm::event::poll(timeout)? {
+                    Ok(Some(crossterm::event::read()?))
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::BlockingReader(receiver) => match receiver.recv_timeout(timeout) {
+                Ok(Ok(event)) => Ok(Some(event)),
+                Ok(Err(error)) => Err(anyhow!(error)),
+                Err(mpsc::RecvTimeoutError::Timeout) => Ok(None),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    Err(anyhow!("terminal input reader stopped"))
+                }
+            },
+        }
+    }
+
+    fn try_read(&mut self) -> Result<Option<crossterm::event::Event>> {
+        match self {
+            Self::Polled => {
+                if crossterm::event::poll(Duration::from_millis(0))? {
+                    Ok(Some(crossterm::event::read()?))
+                } else {
+                    Ok(None)
+                }
+            }
+            Self::BlockingReader(receiver) => match receiver.try_recv() {
+                Ok(Ok(event)) => Ok(Some(event)),
+                Ok(Err(error)) => Err(anyhow!(error)),
+                Err(mpsc::TryRecvError::Empty) => Ok(None),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Err(anyhow!("terminal input reader stopped"))
+                }
+            },
+        }
+    }
 }
 
 pub(crate) fn run_tab(args: &[String], workspace: &Path) -> Result<()> {
@@ -123,9 +201,10 @@ fn run_ui_loop(
     workspace: &Path,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    use crossterm::event::{self, Event, KeyCode, MouseButton, MouseEventKind};
+    use crossterm::event::{Event, KeyCode, MouseButton, MouseEventKind};
 
     let mut state = InteractiveUiState::default();
+    let mut event_source = UiEventSource::new(terminal_input_mode(state.appliance));
     let mut hit_regions = Vec::new();
     let mut last_area = Rect::default();
     let mut throttle = ReloadThrottle::new(RELOAD_THROTTLE);
@@ -170,7 +249,7 @@ fn run_ui_loop(
             hit_regions.clear();
             draw_ui_frame(frame, &model, &state, &mut hit_regions);
         })?;
-        if !event::poll(Duration::from_millis(250))? {
+        let Some(mut next_event) = event_source.wait(Duration::from_millis(250))? else {
             let elapsed = cycle_start.elapsed();
             if should_log_slow_frame(
                 elapsed,
@@ -186,154 +265,155 @@ fn run_ui_loop(
                 last_slow_frame_log = Instant::now();
             }
             continue;
-        }
+        };
 
         // Coalesce: drain all pending events before redrawing. A mouse wheel
         // burst emits dozens of events; without coalescing each one triggers a
         // full disk reload + redraw, freezing the pane for 1–2 seconds.
         let mut should_close = false;
         loop {
-            match event::read()? {
-            Event::Key(key) => {
-                if state.appliance || last_area.width < NARROW_BREAKPOINT {
-                    match handle_narrow_key(key.code, &model, &mut state)? {
-                        NarrowKeyOutcome::Close => {
-                            should_close = true;
-                            break;
+            match next_event {
+                Event::Key(key) => {
+                    if state.appliance || last_area.width < NARROW_BREAKPOINT {
+                        match handle_narrow_key(key.code, &model, &mut state)? {
+                            NarrowKeyOutcome::Close => {
+                                should_close = true;
+                            }
+                            NarrowKeyOutcome::Continue => {}
+                            NarrowKeyOutcome::Action(action) => {
+                                handle_ui_action(action, &model, &mut state, workspace, terminal)?;
+                                throttle.force_reload();
+                            }
                         }
-                        NarrowKeyOutcome::Continue => {}
-                        NarrowKeyOutcome::Action(action) => {
+                    } else if state.filter_editing {
+                        match key.code {
+                            KeyCode::Esc => state.filter_editing = false,
+                            KeyCode::Enter => state.filter_editing = false,
+                            KeyCode::Backspace => {
+                                state.filter.pop();
+                                state.selected_capsule = 0;
+                                throttle.force_reload();
+                            }
+                            KeyCode::Char(value) => {
+                                state.filter.push(value);
+                                state.selected_capsule = 0;
+                                throttle.force_reload();
+                            }
+                            _ => {}
+                        }
+                    } else {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc => {
+                                should_close = true;
+                            }
+                            KeyCode::Tab => state.next_tab(),
+                            KeyCode::BackTab => state.previous_tab(),
+                            KeyCode::Char('1') => state.tab = UiTab::Capsules,
+                            KeyCode::Char('2') => state.tab = UiTab::Activity,
+                            KeyCode::Char('3') | KeyCode::Char('s') => {
+                                state.tab = UiTab::Settings;
+                                state.judge_models = load_judge_model_choices();
+                                state.sync_model_selection(model.status.judge.model.as_ref());
+                            }
+                            KeyCode::Char('4') | KeyCode::Char('d') => state.tab = UiTab::Declined,
+                            KeyCode::Char('/') => {
+                                state.tab = UiTab::Capsules;
+                                state.filter_editing = true;
+                                throttle.force_reload();
+                            }
+                            KeyCode::Char('r') => {
+                                if state.tab == UiTab::Settings {
+                                    state.judge_models = load_judge_model_choices();
+                                    state.sync_model_selection(model.status.judge.model.as_ref());
+                                }
+                            }
+                            KeyCode::Char('j') | KeyCode::Down => state.move_down(&model),
+                            KeyCode::Char('k') | KeyCode::Up => state.move_up(),
+                            KeyCode::Enter => {
+                                if state.tab == UiTab::Settings {
+                                    apply_settings_selection(&mut state)?;
+                                    throttle.force_reload();
+                                } else if state.tab == UiTab::Declined && !model.declined.is_empty()
+                                {
+                                    handle_ui_action(
+                                        UiAction::PromoteDeclined(state.selected_declined),
+                                        &model,
+                                        &mut state,
+                                        workspace,
+                                        terminal,
+                                    )?;
+                                    throttle.force_reload();
+                                } else {
+                                    state.expanded = !state.expanded;
+                                }
+                            }
+                            KeyCode::Left if state.tab == UiTab::Settings => {
+                                adjust_settings_selection(&mut state, -1)?;
+                                throttle.force_reload();
+                            }
+                            KeyCode::Right if state.tab == UiTab::Settings => {
+                                adjust_settings_selection(&mut state, 1)?;
+                                throttle.force_reload();
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Event::Mouse(mouse) => match mouse.kind {
+                    MouseEventKind::ScrollDown
+                        if state.appliance || last_area.width < NARROW_BREAKPOINT =>
+                    {
+                        state.narrow_scroll = state.narrow_scroll.saturating_add(3);
+                    }
+                    MouseEventKind::ScrollUp
+                        if state.appliance || last_area.width < NARROW_BREAKPOINT =>
+                    {
+                        state.narrow_scroll = state.narrow_scroll.saturating_sub(3);
+                    }
+                    MouseEventKind::ScrollDown => state.move_down(&model),
+                    MouseEventKind::ScrollUp => state.move_up(),
+                    MouseEventKind::Down(MouseButton::Left) => {
+                        if let Some(action) = hit_regions
+                            .iter()
+                            .rev()
+                            .find(|region| region.contains(mouse.column, mouse.row))
+                            .map(|region| region.action.clone())
+                        {
                             handle_ui_action(action, &model, &mut state, workspace, terminal)?;
                             throttle.force_reload();
+                        } else if mouse.row <= 3 {
+                            state.tab = if mouse.column > 43 {
+                                UiTab::Declined
+                            } else if mouse.column > 28 {
+                                UiTab::Settings
+                            } else if mouse.column > 13 {
+                                UiTab::Activity
+                            } else {
+                                UiTab::Capsules
+                            };
+                        } else if state.tab == UiTab::Capsules && mouse.row > 6 {
+                            state.selected_capsule = (mouse.row.saturating_sub(7) as usize / 4)
+                                .min(model.capsules.len().saturating_sub(1));
+                        } else if state.tab == UiTab::Activity && mouse.row > 6 {
+                            state.selected_event = (mouse.row.saturating_sub(7) as usize / 2)
+                                .min(model.recent_events.len().saturating_sub(1));
+                        } else if state.tab == UiTab::Declined && mouse.row > 6 {
+                            state.selected_declined = (mouse.row.saturating_sub(7) as usize / 4)
+                                .min(model.declined.len().saturating_sub(1));
                         }
-                    }
-                    continue;
-                }
-                if state.filter_editing {
-                    match key.code {
-                        KeyCode::Esc => state.filter_editing = false,
-                        KeyCode::Enter => state.filter_editing = false,
-                        KeyCode::Backspace => {
-                            state.filter.pop();
-                            state.selected_capsule = 0;
-                            throttle.force_reload();
-                        }
-                        KeyCode::Char(value) => {
-                            state.filter.push(value);
-                            state.selected_capsule = 0;
-                            throttle.force_reload();
-                        }
-                        _ => {}
-                    }
-                    continue;
-                }
-                match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => {
-                        should_close = true;
-                        break;
-                    }
-                    KeyCode::Tab => state.next_tab(),
-                    KeyCode::BackTab => state.previous_tab(),
-                    KeyCode::Char('1') => state.tab = UiTab::Capsules,
-                    KeyCode::Char('2') => state.tab = UiTab::Activity,
-                    KeyCode::Char('3') | KeyCode::Char('s') => {
-                        state.tab = UiTab::Settings;
-                        state.judge_models = load_judge_model_choices();
-                        state.sync_model_selection(model.status.judge.model.as_ref());
-                    }
-                    KeyCode::Char('4') | KeyCode::Char('d') => state.tab = UiTab::Declined,
-                    KeyCode::Char('/') => {
-                        state.tab = UiTab::Capsules;
-                        state.filter_editing = true;
-                        throttle.force_reload();
-                    }
-                    KeyCode::Char('r') => {
-                        if state.tab == UiTab::Settings {
-                            state.judge_models = load_judge_model_choices();
-                            state.sync_model_selection(model.status.judge.model.as_ref());
-                        }
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => state.move_down(&model),
-                    KeyCode::Char('k') | KeyCode::Up => state.move_up(),
-                    KeyCode::Enter => {
-                        if state.tab == UiTab::Settings {
-                            apply_settings_selection(&mut state)?;
-                            throttle.force_reload();
-                        } else if state.tab == UiTab::Declined && !model.declined.is_empty() {
-                            handle_ui_action(
-                                UiAction::PromoteDeclined(state.selected_declined),
-                                &model,
-                                &mut state,
-                                workspace,
-                                terminal,
-                            )?;
-                            throttle.force_reload();
-                        } else {
-                            state.expanded = !state.expanded;
-                        }
-                    }
-                    KeyCode::Left if state.tab == UiTab::Settings => {
-                        adjust_settings_selection(&mut state, -1)?;
-                        throttle.force_reload();
-                    }
-                    KeyCode::Right if state.tab == UiTab::Settings => {
-                        adjust_settings_selection(&mut state, 1)?;
-                        throttle.force_reload();
                     }
                     _ => {}
-                }
-            }
-            Event::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollDown
-                    if state.appliance || last_area.width < NARROW_BREAKPOINT =>
-                {
-                    state.narrow_scroll = state.narrow_scroll.saturating_add(3);
-                }
-                MouseEventKind::ScrollUp
-                    if state.appliance || last_area.width < NARROW_BREAKPOINT =>
-                {
-                    state.narrow_scroll = state.narrow_scroll.saturating_sub(3);
-                }
-                MouseEventKind::ScrollDown => state.move_down(&model),
-                MouseEventKind::ScrollUp => state.move_up(),
-                MouseEventKind::Down(MouseButton::Left) => {
-                    if let Some(action) = hit_regions
-                        .iter()
-                        .rev()
-                        .find(|region| region.contains(mouse.column, mouse.row))
-                        .map(|region| region.action.clone())
-                    {
-                        handle_ui_action(action, &model, &mut state, workspace, terminal)?;
-                        throttle.force_reload();
-                    } else if mouse.row <= 3 {
-                        state.tab = if mouse.column > 43 {
-                            UiTab::Declined
-                        } else if mouse.column > 28 {
-                            UiTab::Settings
-                        } else if mouse.column > 13 {
-                            UiTab::Activity
-                        } else {
-                            UiTab::Capsules
-                        };
-                    } else if state.tab == UiTab::Capsules && mouse.row > 6 {
-                        state.selected_capsule = (mouse.row.saturating_sub(7) as usize / 4)
-                            .min(model.capsules.len().saturating_sub(1));
-                    } else if state.tab == UiTab::Activity && mouse.row > 6 {
-                        state.selected_event = (mouse.row.saturating_sub(7) as usize / 2)
-                            .min(model.recent_events.len().saturating_sub(1));
-                    } else if state.tab == UiTab::Declined && mouse.row > 6 {
-                        state.selected_declined = (mouse.row.saturating_sub(7) as usize / 4)
-                            .min(model.declined.len().saturating_sub(1));
-                    }
-                }
+                },
+                Event::Resize(_, _) => {}
                 _ => {}
-            },
-            Event::Resize(_, _) => {}
-            _ => {}
             }
-            if should_close || !event::poll(Duration::from_millis(0))? {
+            if should_close {
                 break;
             }
+            let Some(event) = event_source.try_read()? else {
+                break;
+            };
+            next_event = event;
         }
         if should_close {
             break;
@@ -3193,6 +3273,12 @@ mod tests {
         assert!(!hit_regions
             .iter()
             .any(|region| matches!(&region.action, UiAction::ToggleZoom)));
+    }
+
+    #[test]
+    fn split_appliance_uses_blocking_terminal_input_reader() {
+        assert_eq!(terminal_input_mode(true), TerminalInputMode::BlockingReader);
+        assert_eq!(terminal_input_mode(false), TerminalInputMode::Polled);
     }
 
     // WS2: ReloadThrottle — reload is forced on first call, then throttled.

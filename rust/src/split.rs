@@ -283,6 +283,17 @@ mod tests {
     }
 
     #[test]
+    fn split_keeps_copilot_in_the_users_workspace_and_state_home() {
+        assert_eq!(SPLIT_LAYOUT.matches("cwd \"{{WORKSPACE}}\"").count(), 2);
+        for isolated_home in ["COPILOT_HOME", "XDG_CONFIG_HOME", "XDG_STATE_HOME"] {
+            assert!(
+                !SPLIT_LAYOUT.contains(isolated_home),
+                "the interactive Copilot pane must retain the user's {isolated_home}"
+            );
+        }
+    }
+
+    #[test]
     fn only_the_arc_appliance_zellij_version_is_accepted() {
         assert!(is_appliance_version("zellij 0.44.3-arc-appliance.1\n"));
         assert!(!is_appliance_version("zellij 0.44.3\n"));
