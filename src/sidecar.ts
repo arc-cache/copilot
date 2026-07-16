@@ -10,6 +10,7 @@ import { sidecarPath } from "./paths.js";
 import { redactJson, redactSensitiveText } from "./redact.js";
 import { debug, loadCapsules } from "./store.js";
 import { localObserverDecide } from "./local-observer.js";
+import { recordReviewerCall, reviewerBudgetReason } from "./telemetry.js";
 import type {
   AssembledDraft,
   Capsule,
@@ -53,7 +54,17 @@ export async function reviewPacket(
   const command = process.env.AGENT_RUN_CACHE_REVIEWER_COMMAND;
   if (command) {
     const input = JSON.stringify(reviewContext ? { ...reviewInput, reviewContext } : reviewInput);
-    const output = await runShellCommand(command, input);
+    const blocked = await reviewerBudgetReason(workspace, packet.sessionId);
+    if (blocked) return { shouldSave: false, reason: blocked };
+    const started = Date.now();
+    let output: string;
+    try {
+      output = await runShellCommand(command, input);
+      await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: "command", durationMs: Date.now() - started, status: "success", input, output });
+    } catch (error) {
+      await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: "command", durationMs: Date.now() - started, status: "failed", input, output: "", reason: "reviewer call failed" });
+      throw error;
+    }
     const parsed = parseReview(output);
     await recordSidecarExchange(workspace, "review", "command", input, output, parsed);
     await debug("sidecar.review.command", { bytes: output.length }, workspace);
@@ -61,14 +72,24 @@ export async function reviewPacket(
   }
   const prompt = reviewPrompt(reviewInput, existingCapsules, reviewContext);
   if (options.reviewer) {
-    const parsed = await options.reviewer({
-      runner: reviewInput.runner,
-      intent,
-      packet: reviewInput,
-      prompt,
-      existingCapsules,
-      reviewContext
-    });
+    const blocked = await reviewerBudgetReason(workspace, packet.sessionId);
+    if (blocked) return { shouldSave: false, reason: blocked };
+    const started = Date.now();
+    let parsed: SidecarReview | null;
+    try {
+      parsed = await options.reviewer({
+        runner: reviewInput.runner,
+        intent,
+        packet: reviewInput,
+        prompt,
+        existingCapsules,
+        reviewContext
+      });
+      await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: "callback", durationMs: Date.now() - started, status: "success", input: prompt, output: JSON.stringify(parsed ?? null) });
+    } catch (error) {
+      await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: "callback", durationMs: Date.now() - started, status: "failed", input: prompt, output: "", reason: "reviewer call failed" });
+      throw error;
+    }
     const output = JSON.stringify(parsed ?? null);
     await recordSidecarExchange(workspace, "review", reviewInput.runner, prompt, output, parsed);
     await debug(`sidecar.review.${reviewInput.runner}`, { bytes: output.length, source: "callback" }, workspace);
@@ -88,7 +109,17 @@ export async function reviewPacket(
     }, workspace);
     return { shouldSave: false, reason };
   }
-  const output = await runModelSidecar(prompt, workspace, runner);
+  const blocked = await reviewerBudgetReason(workspace, packet.sessionId);
+  if (blocked) return { shouldSave: false, reason: blocked };
+  const started = Date.now();
+  let output: string;
+  try {
+    output = await runModelSidecar(prompt, workspace, runner);
+    await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: runner, durationMs: Date.now() - started, status: "success", input: prompt, output });
+  } catch (error) {
+    await recordReviewerCall({ workspace, sessionId: packet.sessionId, source: runner, durationMs: Date.now() - started, status: "failed", input: prompt, output: "", reason: "reviewer call failed" });
+    throw error;
+  }
   const parsed = parseReview(output);
   await recordSidecarExchange(workspace, "review", runner, prompt, output, parsed);
   await debug(`sidecar.review.${runner}`, { bytes: output.length }, workspace);

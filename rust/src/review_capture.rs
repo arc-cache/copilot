@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Instant;
 
 pub(crate) fn import_copilot_transcript(
     path: &Path,
@@ -240,7 +241,11 @@ fn normalize_otel_records(
                     } else {
                         name.clone()
                     }),
-                    raw: Some(json!({ "role": "assistant", "content": text })),
+                    raw: Some(json!({
+                        "role": "assistant",
+                        "content": text,
+                        "usage": otel_usage_attributes(attributes)
+                    })),
                     ..ArcEvent::default()
                 });
                 sequence += 1;
@@ -330,6 +335,21 @@ fn normalize_otel_records(
             .then_with(|| left.id.cmp(&right.id))
     });
     events
+}
+
+fn otel_usage_attributes(attributes: &Value) -> Value {
+    let mut usage = Map::new();
+    for key in [
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+        "gen_ai.usage.total_tokens",
+        "gen_ai.usage.cost_usd",
+    ] {
+        if let Some(value) = attributes.get(key).filter(|value| value.is_number()) {
+            usage.insert(key.to_owned(), value.clone());
+        }
+    }
+    Value::Object(usage)
 }
 
 fn normalize_copilot_record(
@@ -711,6 +731,7 @@ fn review_events_unlocked(
             let capsule: Capsule = serde_json::from_value(capsule_value)?;
             if let Some(saved_capsule) = save_capsule(capsule, workspace)? {
                 let _ = ensure_embeddings_for_capsules(vec![saved_capsule.clone()], workspace);
+                let _ = ensure_binding_snapshots_for_capsule(saved_capsule.clone(), workspace);
                 saved.push(saved_capsule.id);
             }
         }
@@ -893,7 +914,36 @@ fn review_packet(
                 .map(|context| review_input_with_context(review_input, context))
                 .unwrap_or_else(|| review_input.clone());
             let input = serde_json::to_string(&command_input)?;
-            let output = run_shell_command(&command, &input)?;
+            if let Some(reason) = telemetry::reviewer_budget_reason(workspace, &packet.session_id)? {
+                return Ok(Some(json!({ "shouldSave": false, "reason": reason })));
+            }
+            let started = Instant::now();
+            let output = match run_shell_command(&command, &input) {
+                Ok(output) => output,
+                Err(error) => {
+                    telemetry::record_reviewer_call(
+                        workspace,
+                        &packet.session_id,
+                        "command",
+                        started.elapsed().as_millis() as u64,
+                        "failed",
+                        &input,
+                        "",
+                        Some("reviewer call failed"),
+                    )?;
+                    return Err(error);
+                }
+            };
+            telemetry::record_reviewer_call(
+                workspace,
+                &packet.session_id,
+                "command",
+                started.elapsed().as_millis() as u64,
+                "success",
+                &input,
+                &output,
+                None,
+            )?;
             let parsed = extract_json_object(&output)?;
             record_sidecar_exchange(workspace, "review", "command", &input, &output, &parsed)?;
             debug(
@@ -925,7 +975,36 @@ fn review_packet(
         return Ok(Some(json!({ "shouldSave": false, "reason": reason })));
     };
     let prompt = review_prompt(review_input, &existing_capsules, review_context.as_ref());
-    let output = run_model_sidecar(&prompt, workspace, &runner)?;
+    if let Some(reason) = telemetry::reviewer_budget_reason(workspace, &packet.session_id)? {
+        return Ok(Some(json!({ "shouldSave": false, "reason": reason })));
+    }
+    let started = Instant::now();
+    let output = match run_model_sidecar(&prompt, workspace, &runner) {
+        Ok(output) => output,
+        Err(error) => {
+            telemetry::record_reviewer_call(
+                workspace,
+                &packet.session_id,
+                &runner,
+                started.elapsed().as_millis() as u64,
+                "failed",
+                &prompt,
+                "",
+                Some("reviewer call failed"),
+            )?;
+            return Err(error);
+        }
+    };
+    telemetry::record_reviewer_call(
+        workspace,
+        &packet.session_id,
+        &runner,
+        started.elapsed().as_millis() as u64,
+        "success",
+        &prompt,
+        &output,
+        None,
+    )?;
     let parsed = extract_json_object(&output)?;
     record_sidecar_exchange(workspace, "review", &runner, &prompt, &output, &parsed)?;
     debug(
@@ -3516,6 +3595,7 @@ fn run_process_capture(
 fn save_trace_events(events: &[ArcEvent], session_id: &str, workspace: &Path) -> Result<PathBuf> {
     let path = trace_path(session_id, workspace);
     write_jsonl(&path, events)?;
+    telemetry::record_run_from_events(events, workspace, session_id)?;
     debug(
         workspace,
         "trace.saved",

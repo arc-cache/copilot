@@ -187,6 +187,20 @@ export async function buildInjectionPlan(prompt: string, workspace: string, cont
     const capsule = shortlist.find((item) => item.id === sidecar.capsuleId) ?? candidateCapsules.find((item) => item.id === sidecar.capsuleId);
     if (capsule && !matchesDoNotReuse(normalize(prompt), capsule)) {
       const current = await flagCapsuleStaleness(capsule, workspace);
+      if (current.staleness?.stale) {
+        return {
+          shouldInject: false,
+          capsule: current,
+          message: "",
+          reason: `stale capsule rejected: ${current.staleness.reasons.slice(0, 3).join("; ") || "binding sources changed"}`,
+          source: "sidecar",
+          judgeDecisionId,
+          consultApplied: false,
+          consultCapsuleId: current.id,
+          consultAbstainReason: "stale capsule rejected",
+          actionRisk: actionRisk || undefined
+        };
+      }
       const used = await incrementCapsuleUse(current.id, workspace);
       return {
         shouldInject: true,
@@ -229,6 +243,17 @@ export async function buildInjectionPlan(prompt: string, workspace: string, cont
     };
   }
   const current = await flagCapsuleStaleness(capsule, workspace);
+  if (current.staleness?.stale) {
+    return {
+      shouldInject: false,
+      capsule: current,
+      message: "",
+      reason: `stale capsule rejected: ${current.staleness.reasons.slice(0, 3).join("; ") || "binding sources changed"}`,
+      source: "local",
+      judgeDecisionId,
+      actionRisk: actionRisk || undefined
+    };
+  }
   const used = await incrementCapsuleUse(current.id, workspace);
   return {
     shouldInject: true,

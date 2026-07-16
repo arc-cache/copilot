@@ -81,7 +81,7 @@ export function normalizeOtelRecords(records: OTelRecord[], workspace: string, f
           source: "copilot-otel",
           text,
           rawType: name || "chat",
-          raw: { role: "assistant", content: text }
+          raw: { role: "assistant", content: text, usage: otelUsageAttributes(attributes) }
         });
       }
       continue;
@@ -146,6 +146,19 @@ function sessionIdFromSpans(spans: OTelRecord[]): string | null {
     if (id) return id;
   }
   return null;
+}
+
+function otelUsageAttributes(attributes: Record<string, unknown>): Record<string, number> {
+  const usage: Record<string, number> = {};
+  for (const key of [
+    "gen_ai.usage.input_tokens",
+    "gen_ai.usage.output_tokens",
+    "gen_ai.usage.total_tokens",
+    "gen_ai.usage.cost_usd"
+  ]) {
+    if (typeof attributes[key] === "number") usage[key] = attributes[key];
+  }
+  return usage;
 }
 
 function parseMessages(value: unknown): ChatMessage[] {

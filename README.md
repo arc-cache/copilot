@@ -43,9 +43,39 @@ Validation probe: "Test Files  12 passed (12)", exit code 0
 arc split      Copilot plus the live ARC companion pane
 arc ui         the standalone dashboard
 arc status     injection state, capsule count, recent activity
+arc metrics    latency, tool failures, tokens, cost, and policy warnings
+arc replay-eval  evaluate retrieval and redaction against recorded traces
 arc capsules   list kept capsules
 arc doctor     plugin, runtime, and split-view readiness
 ```
+
+The live `arc split` companion and `arc ui` both include a Metrics view. ARC
+records redacted session aggregates: tool timing and outcome, retries, model
+latency, token usage, and cost. Provider-reported usage is labeled `provider`;
+fallback token counts are labeled `estimate`; unavailable cost remains
+`unknown`.
+
+Optional warning and reviewer hard limits live in
+`.agent-run-cache/telemetry-policy.json`:
+
+```json
+{
+  "warnings": {
+    "costUsdPerSession": 2,
+    "slowToolMs": 30000,
+    "repeatedFailures": 2,
+    "retriesPerSession": 3
+  },
+  "reviewer": {
+    "maxCallsPerSession": 2,
+    "hardCostUsdPerSession": 0.5,
+    "estimatedCostUsdPerCall": 0.1
+  }
+}
+```
+
+Debug bundles contain only the sanitized metrics aggregate, never the local
+telemetry ledger.
 
 ## Implementation
 

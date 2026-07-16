@@ -9,6 +9,7 @@ import { cacheDir, workspaceRoot } from "./paths.js";
 import { buildInjectionPlan } from "./retrieval.js";
 import { judgeReachability } from "./judge-reachability.js";
 import { loadCapsules, updateCapsuleMetadata } from "./store.js";
+import { buildMetricsReport } from "./telemetry.js";
 import type { MemoryEvent } from "./ledger.js";
 import type { ArcUiAction, ArcUiCapsuleRow, ArcUiEventRow, ArcUiViewModel } from "./ui-model.js";
 
@@ -19,13 +20,14 @@ export interface LoadArcUiViewModelOptions {
 }
 
 export async function loadArcUiViewModel(workspace = workspaceRoot(), options: LoadArcUiViewModelOptions = {}): Promise<ArcUiViewModel> {
-  const [capsules, events, extension, hook, config, integration] = await Promise.all([
+  const [capsules, events, extension, hook, config, integration, metrics] = await Promise.all([
     loadCapsules(workspace),
     loadMemoryEvents(workspace),
     copilotSdkExtensionStatus(workspace),
     copilotHookStatus(workspace),
     loadArcConfig(),
-    readActivationIntegration(workspace)
+    readActivationIntegration(workspace),
+    buildMetricsReport(workspace)
   ]);
   const query = (options.query ?? "").trim();
   const rows = capsules
@@ -56,6 +58,8 @@ export async function loadArcUiViewModel(workspace = workspaceRoot(), options: L
       lastSave: lastSave ? eventToRow(lastSave) : null,
       generatedAt: new Date().toISOString()
     },
+    metrics: metrics.summary,
+    metricSessions: metrics.sessions.slice(0, 20),
     query,
     capsules: rows,
     selectedCapsule,

@@ -5,6 +5,7 @@ import { appendJsonl, readJsonl, writeJsonl } from "./json.js";
 import { recordMemoryEvent } from "./ledger.js";
 import { debugPath, memoryLockPath, memoryPath, reviewLockPath, reviewedPath, tracePath, workspaceGroup, workspaceKey, workspaceRoot } from "./paths.js";
 import { redactSensitiveText } from "./redact.js";
+import { recordRunFromEvents } from "./telemetry.js";
 import type {
   ArcEvent,
   BindingSourceSnapshot,
@@ -249,6 +250,7 @@ export async function saveTraceEvents(events: ArcEvent[], sessionId: string, wor
   try {
     const current = await readFile(path, "utf8");
     if (current === next) {
+      await recordRunFromEvents(events, workspace, sessionId);
       await debug("trace.unchanged", { sessionId, eventCount: events.length, path }, workspace);
       return path;
     }
@@ -256,6 +258,7 @@ export async function saveTraceEvents(events: ArcEvent[], sessionId: string, wor
     // Missing or unreadable traces are rewritten below.
   }
   await writeJsonl(path, events);
+  await recordRunFromEvents(events, workspace, sessionId);
   await debug("trace.saved", { sessionId, eventCount: events.length, path }, workspace);
   return path;
 }

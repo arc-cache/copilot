@@ -5,6 +5,7 @@ import { basename, join, resolve } from "node:path";
 import { readJsonl, writeJsonl } from "./json.js";
 import { cacheDir, debugPath, memoryEventsPath, memoryPath, reviewedPath, sidecarPath, workspaceRoot } from "./paths.js";
 import { redactJson, redactSensitiveText } from "./redact.js";
+import { sanitizedMetricsAggregate } from "./telemetry.js";
 
 export interface DebugBundleResult {
   path: string;
@@ -36,6 +37,10 @@ export async function writeDebugBundle(outDir?: string, workspace = workspaceRoo
     (manifest.files as unknown[]).push(item.target);
     fileCount += 1;
   }
+
+  await writeFile(join(root, "metrics.aggregate.redacted.json"), `${JSON.stringify(await sanitizedMetricsAggregate(workspace), null, 2)}\n`, "utf8");
+  (manifest.files as unknown[]).push("metrics.aggregate.redacted.json");
+  fileCount += 1;
 
   const traceRoot = join(cacheDir(workspace), "traces");
   const traceOut = join(root, "traces");

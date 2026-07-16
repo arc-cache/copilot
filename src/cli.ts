@@ -30,6 +30,7 @@ import { judgeReachability, type JudgeReachability } from "./judge-reachability.
 import { loadJudgeDecisions, loadRetrievalReputation } from "./retrieval-reputation.js";
 import { currentArcRuntime, resolveArcOnPath } from "./runtime.js";
 import { loadArcUiViewModel } from "./ui-data.js";
+import { buildMetricsReport } from "./telemetry.js";
 import type { Capsule } from "./types.js";
 import type { MemoryEvent } from "./ledger.js";
 
@@ -56,6 +57,10 @@ try {
     await runCapsules(args, workspaceRoot());
   } else if (command === "events") {
     await runEvents(args, workspaceRoot());
+  } else if (command === "metrics") {
+    await runMetrics(args, workspaceRoot());
+  } else if (command === "replay-eval") {
+    await runReplayEval(args, workspaceRoot());
   } else if (command === "probe") {
     await runProbe(args, workspaceRoot());
   } else if (command === "judge") {
@@ -597,6 +602,23 @@ function parseLimit(args: string[]): number {
   return Math.min(Math.floor(value), 2000);
 }
 
+async function runMetrics(args: string[], workspace: string): Promise<void> {
+  assertKnownFlags(args, new Set(["--json"]));
+  const report = await buildMetricsReport(workspace);
+  if (hasJson(args)) return writeJson(report);
+  console.log(`sessions: ${report.summary.sessionCount}`);
+  console.log(`tools: ${report.summary.toolCalls} (failed ${(report.summary.failedToolRate * 100).toFixed(1)}%)`);
+  console.log(`tokens: ${report.summary.tokens.total} (provider ${report.summary.tokens.provider}, estimated ${report.summary.tokens.estimated})`);
+  console.log(`cost: $${report.summary.cost.knownUsd.toFixed(4)}${report.summary.cost.unknownSessions ? ` known; ${report.summary.cost.unknownSessions} session(s) unknown` : ""}`);
+}
+
+async function runReplayEval(args: string[], workspace: string): Promise<void> {
+  assertKnownFlags(args, new Set(["--json"]));
+  const evaluations = (await buildMetricsReport(workspace)).evaluations;
+  if (hasJson(args)) return writeJson(evaluations);
+  console.log(JSON.stringify(evaluations, null, 2));
+}
+
 function stripLimit(args: string[]): string[] {
   const index = args.indexOf("--limit");
   if (index < 0) return args;
@@ -635,6 +657,8 @@ Usage:
   arc capsules declined [--json]
   arc capsules promote <id> [--json]
   arc events [--json] [--limit N]
+  arc metrics --json
+  arc replay-eval --json
   arc probe "<prompt>" [--json]
   arc judge [status|models|decisions|reputation|set] [--json] [--mode embedding-only|provider-judge] [--model provider:id]
   arc doctor [--json]

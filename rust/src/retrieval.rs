@@ -288,8 +288,12 @@ pub(crate) fn build_injection_plan(
                 .find(|item| item.id == capsule_id)
             {
                 if !matches_do_not_reuse(&normalized_prompt, capsule) {
-                    let used = increment_capsule_use(&capsule.id, workspace)?
-                        .unwrap_or_else(|| capsule.clone());
+                    let current = flag_capsule_staleness(capsule.clone(), workspace)?;
+                    if current.staleness.as_ref().is_some_and(|value| value.stale) {
+                        return Ok(stale_rejection_plan(current, "sidecar", judge_decision_id, action_risk));
+                    }
+                    let used = increment_capsule_use(&current.id, workspace)?
+                        .unwrap_or_else(|| current.clone());
                     return Ok(InjectionPlan {
                         should_inject: true,
                         message: format_sidecar_consult_note(
@@ -359,7 +363,11 @@ pub(crate) fn build_injection_plan(
         });
         return Ok(no_plan(&reason, Some("local"), action_risk).with_judge(judge_decision_id));
     };
-    let used = increment_capsule_use(&capsule.id, workspace)?.unwrap_or(capsule);
+    let current = flag_capsule_staleness(capsule, workspace)?;
+    if current.staleness.as_ref().is_some_and(|value| value.stale) {
+        return Ok(stale_rejection_plan(current, "local", judge_decision_id, action_risk));
+    }
+    let used = increment_capsule_use(&current.id, workspace)?.unwrap_or(current);
     Ok(InjectionPlan {
         should_inject: true,
         message: format_capsule_note(&used, mode, prompt),
@@ -376,6 +384,32 @@ pub(crate) fn build_injection_plan(
         consult_abstain_reason: None,
         action_risk,
     })
+}
+
+fn stale_rejection_plan(
+    capsule: Capsule,
+    source: &str,
+    judge_decision_id: Option<String>,
+    action_risk: Option<String>,
+) -> InjectionPlan {
+    let detail = capsule
+        .staleness
+        .as_ref()
+        .map(|value| value.reasons.iter().take(3).cloned().collect::<Vec<_>>().join("; "))
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "binding sources changed".to_owned());
+    InjectionPlan {
+        should_inject: false,
+        capsule: Some(capsule),
+        message: String::new(),
+        reason: format!("stale capsule rejected: {detail}"),
+        source: Some(source.to_owned()),
+        judge_decision_id,
+        consult_applied: None,
+        consult_capsule_id: None,
+        consult_abstain_reason: Some("stale capsule rejected".to_owned()),
+        action_risk,
+    }
 }
 
 trait PlanExt {
@@ -590,6 +624,95 @@ pub(crate) fn ensure_embeddings_for_capsules(
     }
     fresh.extend(with_embeddings);
     Ok(fresh)
+}
+
+pub(crate) fn ensure_binding_snapshots_for_capsule(
+    mut capsule: Capsule,
+    workspace: &Path,
+) -> Result<Capsule> {
+    let snapshots = capture_binding_snapshots(&capsule, workspace);
+    if snapshots.is_empty() {
+        return Ok(capsule);
+    }
+    capsule.binding_snapshots = Some(snapshots);
+    capsule.staleness = Some(CapsuleStaleness {
+        stale: false,
+        checked_at: now_iso(),
+        reasons: Vec::new(),
+    });
+    update_capsule_binding_state(&capsule, workspace)?;
+    Ok(capsule)
+}
+
+fn flag_capsule_staleness(mut capsule: Capsule, workspace: &Path) -> Result<Capsule> {
+    let Some(previous) = capsule.binding_snapshots.as_ref().filter(|items| !items.is_empty()) else {
+        return Ok(capsule);
+    };
+    let current = capture_binding_snapshots(&capsule, workspace);
+    if current.is_empty() {
+        return Ok(capsule);
+    }
+    let by_source = current.iter().map(|snapshot| (snapshot.source.as_str(), snapshot)).collect::<HashMap<_, _>>();
+    let mut reasons = Vec::new();
+    for old in previous {
+        let Some(next) = by_source.get(old.source.as_str()) else { continue; };
+        if old.exists != next.exists {
+            reasons.push(format!("{} existence changed", old.source));
+        } else if old.hash.is_some() && next.hash.is_some() && old.hash != next.hash {
+            reasons.push(format!("{} content hash changed", old.source));
+        }
+    }
+    reasons.truncate(12);
+    let staleness = CapsuleStaleness { stale: !reasons.is_empty(), checked_at: now_iso(), reasons };
+    if capsule.staleness.as_ref().is_some_and(|value| value.stale == staleness.stale && value.reasons == staleness.reasons) {
+        return Ok(capsule);
+    }
+    capsule.staleness = Some(staleness);
+    update_capsule_binding_state(&capsule, workspace)?;
+    Ok(capsule)
+}
+
+fn capture_binding_snapshots(capsule: &Capsule, workspace: &Path) -> Vec<BindingSourceSnapshot> {
+    active_binding_sources(capsule)
+        .into_iter()
+        .filter(|source| !source.is_empty() && !source.contains('<') && !source.starts_with("http://") && !source.starts_with("https://"))
+        .take(12)
+        .map(|source| {
+            let path = if Path::new(&source).is_absolute() { PathBuf::from(&source) } else { workspace.join(&source) };
+            let captured_at = now_iso();
+            let Ok(metadata) = fs::metadata(&path) else {
+                return BindingSourceSnapshot { source, exists: false, hash: None, captured_at };
+            };
+            let hash = if metadata.is_file() && metadata.len() <= max_snapshot_bytes() {
+                fs::read(&path).ok().map(|data| {
+                    let mut hasher = Sha256::new();
+                    hasher.update(data);
+                    hex::encode(hasher.finalize())
+                })
+            } else {
+                let modified = metadata.modified().ok().and_then(|value| value.duration_since(UNIX_EPOCH).ok()).map(|value| value.as_secs()).unwrap_or(0);
+                Some(sha256_hex(&format!("{}:{modified}", metadata.len())))
+            };
+            BindingSourceSnapshot { source, exists: true, hash, captured_at }
+        })
+        .collect()
+}
+
+fn max_snapshot_bytes() -> u64 {
+    env::var("AGENT_RUN_CACHE_MAX_SNAPSHOT_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+}
+
+fn update_capsule_binding_state(capsule: &Capsule, workspace: &Path) -> Result<()> {
+    let mut capsules = load_capsules(workspace)?;
+    if let Some(index) = capsules.iter().position(|value| value.id == capsule.id) {
+        capsules[index].binding_snapshots = capsule.binding_snapshots.clone();
+        capsules[index].staleness = capsule.staleness.clone();
+        write_jsonl(&memory_path(workspace), &capsules)?;
+    }
+    Ok(())
 }
 
 fn update_capsule_embedding(id: &str, embedding: CapsuleEmbedding, workspace: &Path) -> Result<()> {

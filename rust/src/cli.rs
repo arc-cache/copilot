@@ -28,6 +28,8 @@ pub(crate) fn run() -> Result<()> {
         Some("capsules") => run_capsules(&args, &workspace),
         Some("capsule") => run_capsule(&args, &workspace),
         Some("events") => run_events(&args, &workspace),
+        Some("metrics") => run_metrics(&args, &workspace),
+        Some("replay-eval") => run_replay_eval(&args, &workspace),
         Some("probe") | Some("consult") | Some("inject") => {
             run_probe(&args, &workspace, command.as_deref().unwrap_or("probe"))
         }
@@ -59,6 +61,6 @@ pub(crate) fn run() -> Result<()> {
 
 fn print_help() {
     println!(
-        "Agent Run Cache\n\nUsage:\n  arc\n  arc ui\n  arc split [--copilot-command \"<command>\"]\n  arc plugin install|status|path [--json]\n  arc setup [--sidecar-copilot-command \"<command>\"] [--enable-experimental]\n  arc mcp\n  arc hook copilot <Event>\n  arc status|capsules|events|probe --json\n  arc capsule <id> [--json]\n  arc capsules [set|delete|share|declined|promote] ... [--json]\n  arc pause [1h|2h|today|off] [--json]\n  arc resume [--json]\n  arc judge [status|models|decisions|reputation|set] [--json]\n  arc import-copilot <events.jsonl>\n  arc import-otel <otel.jsonl> [session-id]\n  arc harvest <copilot-session-id>\n  arc logs [--follow]\n  arc debug-bundle [out-dir]\n  arc ask [--runner opencode] <prompt>\n  arc reset --yes\n  arc smoke\n\nRun `arc split` for Copilot with a mouse-driven ARC pane beside it, `arc ui` for the standalone dashboard, or `/arc` inside Copilot after `/settings experimental on` for the in-session menu. Plain Copilot launches still use plugin hooks and MCP tools without the experimental flag.\n\nRust port note: plugin hooks, MCP, retrieval, judge ledger, capture/review, managed embeddings, UI, and long-tail inspection/debug commands are implemented. Legacy experimental acp/sdk-extension/copilot-tab surfaces are explicit demoted commands and are not part of the normal plugin flow."
+        "Agent Run Cache\n\nUsage:\n  arc\n  arc ui\n  arc split [--copilot-command \"<command>\"]\n  arc plugin install|status|path [--json]\n  arc setup [--sidecar-copilot-command \"<command>\"] [--enable-experimental]\n  arc mcp\n  arc hook copilot <Event>\n  arc status|capsules|events|probe --json\n  arc metrics --json\n  arc replay-eval --json\n  arc capsule <id> [--json]\n  arc capsules [set|delete|share|declined|promote] ... [--json]\n  arc pause [1h|2h|today|off] [--json]\n  arc resume [--json]\n  arc judge [status|models|decisions|reputation|set] [--json]\n  arc import-copilot <events.jsonl>\n  arc import-otel <otel.jsonl> [session-id]\n  arc harvest <copilot-session-id>\n  arc logs [--follow]\n  arc debug-bundle [out-dir]\n  arc ask [--runner opencode] <prompt>\n  arc reset --yes\n  arc smoke\n\nRun `arc split` for Copilot with a mouse-driven ARC pane beside it, `arc ui` for the standalone dashboard, or `/arc` inside Copilot after `/settings experimental on` for the in-session menu. Plain Copilot launches still use plugin hooks and MCP tools without the experimental flag.\n\nRust port note: plugin hooks, MCP, retrieval, judge ledger, capture/review, managed embeddings, UI, and long-tail inspection/debug commands are implemented. Legacy experimental acp/sdk-extension/copilot-tab surfaces are explicit demoted commands and are not part of the normal plugin flow."
     );
 }
