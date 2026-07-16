@@ -4,6 +4,7 @@ import { memoryEventsPath, workspaceRoot } from "./paths.js";
 export type MemoryEventType =
   | "turn.started"
   | "capsule.injected"
+  | "capsule.retrieval"
   | "runner.started"
   | "runner.completed"
   | "runner.failed"

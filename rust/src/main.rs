@@ -25,6 +25,7 @@ mod retrieval;
 mod review_capture;
 mod split;
 mod store;
+mod telemetry;
 mod ui;
 
 use embedder::{embed_texts, embedding_unavailable_reason, stop_local_embeddings};
@@ -40,7 +41,10 @@ use plugin::{
     remember_copilot_plugin_workspace, run_copilot_tab, run_json_hooks, run_plugin, run_setup,
     write_activation,
 };
-use retrieval::{build_injection_plan, ensure_embeddings_for_capsules, search_capsules_for_query};
+use retrieval::{
+    build_injection_plan, ensure_binding_snapshots_for_capsule, ensure_embeddings_for_capsules,
+    search_capsules_for_query,
+};
 use review_capture::{
     harvest_latest_session, harvest_session, import_copilot_otel, import_copilot_transcript,
     load_declined_draft_views, promote_declined_draft, record_sidecar_exchange, review_events,
@@ -48,6 +52,7 @@ use review_capture::{
 };
 use split::{cached_zellij, run_split};
 use store::{increment_capsule_use, load_capsules, save_capsule, update_capsule_metadata};
+use telemetry::{build_metrics_report, sanitized_metrics_aggregate};
 use ui::{load_ui_view_model, render_status_summary, run_tab, run_ui, UiOptions};
 
 const SERVER_VERSION: &str = "2.1.0";
@@ -125,6 +130,33 @@ fn run_status(args: &[String], workspace: &Path) -> Result<()> {
         }
         Ok(())
     }
+}
+
+fn run_metrics(args: &[String], workspace: &Path) -> Result<()> {
+    assert_known_flags(args, &["--json"])?;
+    let report = build_metrics_report(workspace)?;
+    if has_json(args) {
+        return write_json(&report);
+    }
+    println!("sessions: {}", report.summary.session_count);
+    println!("tools: {} (failed {:.1}%)", report.summary.tool_calls, report.summary.failed_tool_rate * 100.0);
+    println!("tokens: {} (provider {}, estimated {})", report.summary.tokens.total, report.summary.tokens.provider, report.summary.tokens.estimated);
+    if report.summary.cost.unknown_sessions > 0 {
+        println!("cost: ${:.4} known; {} session(s) unknown", report.summary.cost.known_usd, report.summary.cost.unknown_sessions);
+    } else {
+        println!("cost: ${:.4}", report.summary.cost.known_usd);
+    }
+    Ok(())
+}
+
+fn run_replay_eval(args: &[String], workspace: &Path) -> Result<()> {
+    assert_known_flags(args, &["--json"])?;
+    let report = build_metrics_report(workspace)?;
+    if has_json(args) {
+        return write_json(&report.evaluations);
+    }
+    println!("{}", serde_json::to_string_pretty(&report.evaluations)?);
+    Ok(())
 }
 
 fn run_capsules(args: &[String], workspace: &Path) -> Result<()> {
@@ -1072,6 +1104,10 @@ fn write_debug_bundle(out_dir: Option<&Path>, workspace: &Path) -> Result<DebugB
         files.push(Value::String(target.to_owned()));
         file_count += 1;
     }
+    let metrics = sanitized_metrics_aggregate(workspace)?;
+    write_pretty_json(&root.join("metrics.aggregate.redacted.json"), &metrics)?;
+    files.push(Value::String("metrics.aggregate.redacted.json".to_owned()));
+    file_count += 1;
     let trace_root = cache_dir(workspace).join("traces");
     let trace_out = root.join("traces");
     if trace_root.exists() {
@@ -2206,6 +2242,19 @@ fn build_copilot_prompt_injection(
             "copilot.prompt.no_context",
             json!({ "sessionId": session_id, "surface": surface, "reason": plan.reason }),
         )?;
+        record_memory_event(
+            workspace,
+            "capsule.retrieval",
+            Some(session_id.to_owned()),
+            None,
+            plan.capsule.as_ref().map(|capsule| capsule.id.clone()),
+            Some(json!({
+                "decision": "abstained",
+                "source": plan.source,
+                "reason": plan.reason,
+                "capsuleWasStale": plan.capsule.as_ref().and_then(|capsule| capsule.staleness.as_ref()).map(|value| value.stale).unwrap_or(false)
+            })),
+        )?;
         return Ok(json!({ "hookResult": {}, "plan": summary }));
     }
     debug(
@@ -2225,6 +2274,8 @@ fn build_copilot_prompt_injection(
             "reason": plan.reason,
             "title": plan.capsule.as_ref().map(|c| c.title.clone()),
             "injected": true,
+            "decision": "injected",
+            "capsuleWasStale": plan.capsule.as_ref().and_then(|capsule| capsule.staleness.as_ref()).map(|value| value.stale).unwrap_or(false),
             "used": "unknown",
             "helped": "unknown",
             "judgeDecisionId": plan.judge_decision_id,

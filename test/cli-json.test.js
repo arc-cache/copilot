@@ -8,7 +8,7 @@ import test from "node:test";
 import { buildHookCommand } from "../dist/install.js";
 import { recordMemoryEvent } from "../dist/ledger.js";
 import { recordJudgeDecision, recordJudgeOutcome } from "../dist/retrieval-reputation.js";
-import { transientRuntimeReason } from "../dist/runtime.js";
+import { assertDurableArcRuntime, transientRuntimeReason } from "../dist/runtime.js";
 import { saveCapsule } from "../dist/store.js";
 
 const cli = resolve("dist/cli.js");
@@ -155,6 +155,23 @@ test("transient npm exec runtimes are detected before setup pins hooks", () => {
     "/.cache/pnpm/dlx/"
   );
   assert.equal(transientRuntimeReason("/usr/local/lib/node_modules/agent-run-cache/dist/cli.js"), undefined);
+});
+
+test("transient runtime guidance names the published npm package", () => {
+  assert.throws(
+    () => assertDurableArcRuntime({
+      node: process.execPath,
+      entrypoint: cli,
+      packageRoot: resolve("."),
+      transient: true,
+      transientReason: "/.npm/_npx/"
+    }),
+    (error) => {
+      assert.match(error.message, /npm i -g arc-copilot/);
+      assert.doesNotMatch(error.message, /npm i -g agent-run-cache/);
+      return true;
+    }
+  );
 });
 
 test("plugin command exposes a marketplace-ready local plugin and installs through copilot plugin install", withCliCache(async ({ cwd, env }) => {

@@ -316,6 +316,7 @@ fn run_ui_loop(
                                 state.sync_model_selection(model.status.judge.model.as_ref());
                             }
                             KeyCode::Char('4') | KeyCode::Char('d') => state.tab = UiTab::Declined,
+                            KeyCode::Char('5') | KeyCode::Char('m') => state.tab = UiTab::Metrics,
                             KeyCode::Char('/') => {
                                 state.tab = UiTab::Capsules;
                                 state.filter_editing = true;
@@ -382,7 +383,9 @@ fn run_ui_loop(
                             handle_ui_action(action, &model, &mut state, workspace, terminal)?;
                             throttle.force_reload();
                         } else if mouse.row <= 3 {
-                            state.tab = if mouse.column > 43 {
+                            state.tab = if mouse.column > 57 {
+                                UiTab::Metrics
+                            } else if mouse.column > 43 {
                                 UiTab::Declined
                             } else if mouse.column > 28 {
                                 UiTab::Settings
@@ -442,6 +445,7 @@ enum UiTab {
     Capsules,
     Activity,
     Declined,
+    Metrics,
     Settings,
 }
 
@@ -452,6 +456,7 @@ enum NarrowScreen {
     CapsuleDetail,
     Activity,
     Declined,
+    Metrics,
     Judge,
     Injection,
 }
@@ -573,7 +578,8 @@ impl InteractiveUiState {
         self.tab = match self.tab {
             UiTab::Capsules => UiTab::Declined,
             UiTab::Declined => UiTab::Activity,
-            UiTab::Activity => UiTab::Settings,
+            UiTab::Activity => UiTab::Metrics,
+            UiTab::Metrics => UiTab::Settings,
             UiTab::Settings => UiTab::Capsules,
         };
     }
@@ -583,7 +589,8 @@ impl InteractiveUiState {
             UiTab::Capsules => UiTab::Settings,
             UiTab::Declined => UiTab::Capsules,
             UiTab::Activity => UiTab::Declined,
-            UiTab::Settings => UiTab::Activity,
+            UiTab::Metrics => UiTab::Activity,
+            UiTab::Settings => UiTab::Metrics,
         };
     }
 
@@ -601,6 +608,7 @@ impl InteractiveUiState {
                 self.selected_declined =
                     (self.selected_declined + 1).min(model.declined.len().saturating_sub(1));
             }
+            UiTab::Metrics => {}
             UiTab::Settings => self.settings_row = (self.settings_row + 1).min(1),
         }
     }
@@ -610,6 +618,7 @@ impl InteractiveUiState {
             UiTab::Capsules => self.selected_capsule = self.selected_capsule.saturating_sub(1),
             UiTab::Activity => self.selected_event = self.selected_event.saturating_sub(1),
             UiTab::Declined => self.selected_declined = self.selected_declined.saturating_sub(1),
+            UiTab::Metrics => {}
             UiTab::Settings => self.settings_row = self.settings_row.saturating_sub(1),
         }
     }
@@ -661,7 +670,7 @@ fn handle_narrow_key(
             return Ok(NarrowKeyOutcome::Action(UiAction::Back));
         }
         KeyCode::Down | KeyCode::Char('j') => match state.narrow_screen {
-            NarrowScreen::Summary => state.narrow_row = (state.narrow_row + 1).min(4),
+            NarrowScreen::Summary => state.narrow_row = (state.narrow_row + 1).min(5),
             NarrowScreen::Capsules => {
                 state.selected_capsule =
                     (state.selected_capsule + 1).min(model.capsules.len().saturating_sub(1));
@@ -695,6 +704,7 @@ fn handle_narrow_key(
             NarrowScreen::Judge => {
                 state.narrow_row = (state.narrow_row + 1).min(state.judge_models.len());
             }
+            NarrowScreen::Metrics => {}
             NarrowScreen::Injection => state.narrow_row = (state.narrow_row + 1).min(3),
         },
         KeyCode::Up | KeyCode::Char('k') => match state.narrow_screen {
@@ -718,6 +728,7 @@ fn handle_narrow_key(
             NarrowScreen::CapsuleDetail | NarrowScreen::Judge | NarrowScreen::Injection => {
                 state.narrow_row = state.narrow_row.saturating_sub(1);
             }
+            NarrowScreen::Metrics => {}
         },
         KeyCode::PageDown => state.narrow_scroll = state.narrow_scroll.saturating_add(8),
         KeyCode::PageUp => state.narrow_scroll = state.narrow_scroll.saturating_sub(8),
@@ -750,6 +761,7 @@ fn handle_narrow_key(
                     _ => InjectionChoice::Today,
                 })),
                 NarrowScreen::Activity => None,
+                NarrowScreen::Metrics => None,
                 NarrowScreen::Declined => None,
                 NarrowScreen::Capsules => None,
             };
@@ -798,7 +810,8 @@ fn handle_ui_action(
                 0 => NarrowScreen::Capsules,
                 1 => NarrowScreen::Declined,
                 2 => NarrowScreen::Activity,
-                3 => NarrowScreen::Judge,
+                3 => NarrowScreen::Metrics,
+                4 => NarrowScreen::Judge,
                 _ => NarrowScreen::Injection,
             };
             state.narrow_row = 0;
@@ -1003,6 +1016,7 @@ fn draw_ui_frame(
         UiTab::Capsules => draw_capsules_tab(frame, chunks[2], model, state),
         UiTab::Activity => draw_activity_tab(frame, chunks[2], model, state),
         UiTab::Declined => draw_declined_tab(frame, chunks[2], model, state, hit_regions),
+        UiTab::Metrics => draw_metrics_tab(frame, chunks[2], model),
         UiTab::Settings => draw_settings_tab(frame, chunks[2], model, state),
     }
 
@@ -1044,6 +1058,7 @@ fn draw_narrow_ui(
         }
         NarrowScreen::Activity => draw_narrow_activity(frame, area, model, state, hit_regions),
         NarrowScreen::Declined => draw_narrow_declined(frame, area, model, state, hit_regions),
+        NarrowScreen::Metrics => draw_narrow_metrics(frame, area, model, state, hit_regions),
         NarrowScreen::Judge => draw_narrow_judge(frame, area, model, state, hit_regions),
         NarrowScreen::Injection => draw_narrow_injection(frame, area, model, state, hit_regions),
     }
@@ -1079,6 +1094,7 @@ fn draw_narrow_summary(
         ("capsules", model.status.capsule_count.to_string()),
         ("declined", model.status.declined_count.to_string()),
         ("activity", model.status.event_count.to_string()),
+        ("metrics", format!("{} runs", model.metrics.session_count)),
         ("judge", fit_words(judge, width.saturating_sub(13))),
         ("injection", fit_words(injection, width.saturating_sub(13))),
     ];
@@ -1570,6 +1586,83 @@ fn draw_narrow_activity(
     );
 }
 
+fn draw_narrow_metrics(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    model: &ArcUiViewModel,
+    state: &InteractiveUiState,
+    hit_regions: &mut Vec<HitRegion>,
+) {
+    let width = area.width.max(1) as usize;
+    let metrics = &model.metrics;
+    let mut lines = vec![
+        Line::from(Span::styled(
+            "‹ metrics",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        hairline(width),
+        Line::raw(""),
+        Line::raw(format!("sessions  {}", metrics.session_count)),
+        Line::raw(format!(
+            "tools     {} · {:.1}% failed",
+            metrics.tool_calls,
+            metrics.failed_tool_rate * 100.0
+        )),
+        Line::raw(format!("retries   {}", metrics.retries)),
+        hairline(width),
+        Line::raw(format!(
+            "session   {}",
+            latency_label(&metrics.latency_ms.session)
+        )),
+        Line::raw(format!(
+            "model     {}",
+            latency_label(&metrics.latency_ms.model_first_response)
+        )),
+        Line::raw(format!(
+            "tools     {}",
+            latency_label(&metrics.latency_ms.tool)
+        )),
+        hairline(width),
+        Line::raw(format!("tokens    {}", metrics.tokens.total)),
+        Line::raw(format!("provider  {}", metrics.tokens.provider)),
+        Line::raw(format!("estimate  {}", metrics.tokens.estimated)),
+        Line::raw(cost_label(metrics)),
+        Line::raw(format!("warnings  {}", metrics.warnings)),
+    ];
+    for warning in metrics.warning_messages.iter().take(2) {
+        lines.push(Line::from(Span::styled(
+            clip_text(warning, width),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if !model.metric_sessions.is_empty() {
+        lines.push(hairline(width));
+        for session in model.metric_sessions.iter().take(3) {
+            lines.push(Line::raw(format!(
+                "{}  {}",
+                short(&session.session_id, 8),
+                session.status
+            )));
+            lines.push(Line::raw(session_token_label(session)));
+            lines.push(Line::raw(session_cost_label(session)));
+        }
+    }
+    let actions = std::iter::once(Some(UiAction::Back))
+        .chain(std::iter::repeat(None).take(lines.len().saturating_sub(1)))
+        .collect();
+    render_narrow_document(
+        frame,
+        area,
+        lines,
+        actions,
+        Vec::new(),
+        state.narrow_scroll,
+        hit_regions,
+    );
+}
+
 fn draw_narrow_judge(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1964,6 +2057,8 @@ fn tab_bar(model: &ArcUiViewModel, state: &InteractiveUiState) -> Paragraph<'sta
         tab_span("3 Settings", state.tab == UiTab::Settings),
         Span::raw("   "),
         tab_span("4 Declined", state.tab == UiTab::Declined),
+        Span::raw("  "),
+        tab_span("5 Metrics", state.tab == UiTab::Metrics),
         Span::raw("   "),
         Span::styled(seam, Style::default().fg(Color::DarkGray)),
         Span::raw("   filter "),
@@ -2277,6 +2372,139 @@ fn draw_activity_tab(
         area,
         &mut list_state,
     );
+}
+
+fn draw_metrics_tab(frame: &mut Frame<'_>, area: Rect, model: &ArcUiViewModel) {
+    let metrics = &model.metrics;
+    let mut rows = vec![
+        Line::from(Span::styled(
+            "RUN TELEMETRY",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+        Line::raw(format!("sessions             {}", metrics.session_count)),
+        Line::raw(format!(
+            "failed-tool rate     {:.1}%  ({} / {})",
+            metrics.failed_tool_rate * 100.0,
+            metrics.failed_tools,
+            metrics.tool_calls
+        )),
+        Line::raw(format!("retries              {}", metrics.retries)),
+        Line::raw(format!(
+            "session latency      {}",
+            latency_label(&metrics.latency_ms.session)
+        )),
+        Line::raw(format!(
+            "model first response {}",
+            latency_label(&metrics.latency_ms.model_first_response)
+        )),
+        Line::raw(format!(
+            "tool latency         {}",
+            latency_label(&metrics.latency_ms.tool)
+        )),
+        Line::raw(format!(
+            "tokens               {}  provider {} · estimated {}",
+            metrics.tokens.total, metrics.tokens.provider, metrics.tokens.estimated
+        )),
+        Line::raw(cost_label(metrics)),
+        Line::raw(format!("policy warnings      {}", metrics.warnings)),
+    ];
+    for warning in metrics.warning_messages.iter().take(3) {
+        rows.push(Line::from(Span::styled(
+            format!("warning              {warning}"),
+            Style::default().fg(Color::Yellow),
+        )));
+    }
+    if !model.metric_sessions.is_empty() {
+        rows.push(Line::raw(""));
+        rows.push(Line::from(Span::styled(
+            "RECENT SESSIONS",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )));
+        for session in model.metric_sessions.iter().take(5) {
+            rows.push(Line::raw(format!(
+                "{}  {}",
+                short(&session.session_id, 12),
+                metric_session_label(session)
+            )));
+        }
+    }
+    rows.extend([
+        Line::raw(""),
+        Line::from(Span::styled("Cost stays unknown unless Copilot/provider usage or an explicit reviewer estimate is available.", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("Configure warning and hard reviewer budgets in .agent-run-cache/telemetry-policy.json.", Style::default().fg(Color::DarkGray))),
+    ]);
+    frame.render_widget(
+        Paragraph::new(rows)
+            .wrap(Wrap { trim: true })
+            .block(Block::default().title("Metrics").borders(Borders::ALL)),
+        area,
+    );
+}
+
+fn latency_label(value: &telemetry::Percentiles) -> String {
+    if value.count == 0 {
+        return "unknown".to_owned();
+    }
+    format!(
+        "p50 {}ms · p95 {}ms · p99 {}ms",
+        value
+            .p50
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| "?".to_owned()),
+        value
+            .p95
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| "?".to_owned()),
+        value
+            .p99
+            .map(|item| item.to_string())
+            .unwrap_or_else(|| "?".to_owned()),
+    )
+}
+
+fn cost_label(metrics: &telemetry::MetricsSummary) -> String {
+    format!("cost                 {}", cost_value_label(metrics))
+}
+
+fn cost_value_label(metrics: &telemetry::MetricsSummary) -> String {
+    if metrics.cost.unknown_sessions > 0 {
+        format!(
+            "${:.4} known · {} session(s) unknown",
+            metrics.cost.known_usd, metrics.cost.unknown_sessions
+        )
+    } else {
+        format!("${:.4}", metrics.cost.known_usd)
+    }
+}
+
+fn metric_session_label(session: &telemetry::SessionMetrics) -> String {
+    format!(
+        "{} · {} · {}",
+        session.status,
+        session_token_label(session),
+        session_cost_label(session)
+    )
+}
+
+fn session_token_label(session: &telemetry::SessionMetrics) -> String {
+    session
+        .tokens
+        .total
+        .map(|value| format!("{value} tokens ({})", session.tokens.source))
+        .unwrap_or_else(|| "tokens unknown".to_owned())
+}
+
+fn session_cost_label(session: &telemetry::SessionMetrics) -> String {
+    session
+        .cost
+        .usd
+        .map(|value| format!("${value:.4} ({})", session.cost.source))
+        .unwrap_or_else(|| "cost unknown".to_owned())
 }
 
 fn activity_item(event: &ArcUiEventRow) -> ListItem<'static> {
@@ -2683,6 +2911,8 @@ pub(crate) struct UiOptions {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ArcUiViewModel {
     status: ArcUiStatus,
+    metrics: telemetry::MetricsSummary,
+    metric_sessions: Vec<telemetry::SessionMetrics>,
     query: String,
     capsules: Vec<ArcUiCapsuleRow>,
     selected_capsule: Option<ArcUiCapsuleRow>,
@@ -2766,6 +2996,9 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
     let config = load_arc_config()?;
     let reachability = judge_reachability(&config);
     let injection_pause = injection_pause_status(&config);
+    let metrics_report = telemetry::build_metrics_report(workspace)?;
+    let metrics = metrics_report.summary;
+    let metric_sessions = metrics_report.sessions.into_iter().take(20).collect();
     capsules.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
     let query = options.query.trim().to_owned();
     let rows = capsules
@@ -2818,6 +3051,8 @@ pub(crate) fn load_ui_view_model(workspace: &Path, options: UiOptions) -> Result
             last_save,
             generated_at: now_iso(),
         },
+        metrics,
+        metric_sessions,
         query,
         capsules: rows,
         selected_capsule,
@@ -2956,7 +3191,14 @@ fn render_ui_text(model: &ArcUiViewModel) -> String {
         },
         model.status.repo
     ));
-    out.push_str("1 Capsules  2 Activity  3 Settings\n");
+    out.push_str("1 Capsules  2 Activity  3 Settings  4 Declined  5 Metrics\n");
+    out.push_str(&format!(
+        "metrics: {} sessions · {:.1}% failed tools · {} tokens · {}\n",
+        model.metrics.session_count,
+        model.metrics.failed_tool_rate * 100.0,
+        model.metrics.tokens.total,
+        cost_value_label(&model.metrics)
+    ));
     out.push_str("filter : all capsules\n\n");
     if model.capsules.is_empty() {
         out.push_str(
@@ -3082,6 +3324,8 @@ mod tests {
                 last_save: None,
                 generated_at: now_iso(),
             },
+            metrics: telemetry::MetricsSummary::default(),
+            metric_sessions: Vec::new(),
             query: String::new(),
             capsules: vec![capsule.clone()],
             selected_capsule: Some(capsule),
@@ -3136,7 +3380,7 @@ mod tests {
         assert!(text.contains("capsules"));
         assert!(text.contains("declined"));
         assert!(text.contains("injection"));
-        for row in 0..5 {
+        for row in 0..6 {
             assert!(hit_regions.iter().any(|region| {
                 matches!(
                     &region.action,
@@ -3144,6 +3388,76 @@ mod tests {
                 )
             }));
         }
+    }
+
+    #[test]
+    fn metrics_are_visible_in_split_and_standalone_views() {
+        let mut model = test_model();
+        model.metrics.session_count = 3;
+        model.metrics.tool_calls = 10;
+        model.metrics.failed_tools = 2;
+        model.metrics.failed_tool_rate = 0.2;
+        model.metrics.tokens.total = 1_234;
+        model.metrics.latency_ms.tool = telemetry::Percentiles {
+            count: 3,
+            p50: Some(120),
+            p95: Some(800),
+            p99: Some(800),
+        };
+        model.metric_sessions.push(telemetry::SessionMetrics {
+            session_id: "session-metrics-1".to_owned(),
+            started_at: now_iso(),
+            ended_at: now_iso(),
+            duration_ms: 1_000,
+            status: "success".to_owned(),
+            turns: 1,
+            tool_calls: 2,
+            failed_tools: 0,
+            failed_tool_rate: 0.0,
+            retries: 0,
+            model_first_response_ms: Some(120),
+            tokens: telemetry::SessionMeasurement {
+                total: Some(400),
+                source: "provider".to_owned(),
+            },
+            cost: telemetry::SessionCost {
+                usd: Some(0.125),
+                source: "provider".to_owned(),
+            },
+            reviewer_calls: 0,
+            warning_count: 0,
+        });
+
+        let narrow = InteractiveUiState {
+            narrow_screen: NarrowScreen::Metrics,
+            ..InteractiveUiState::default()
+        };
+        let backend = TestBackend::new(40, 22);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut hit_regions = Vec::new();
+        terminal
+            .draw(|frame| draw_ui_frame(frame, &model, &narrow, &mut hit_regions))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("‹ metrics"));
+        assert!(text.contains("20.0% failed"));
+        assert!(text.contains("1234"));
+        assert!(text.contains("$0.1250"));
+
+        let wide = InteractiveUiState {
+            appliance: false,
+            tab: UiTab::Metrics,
+            ..InteractiveUiState::default()
+        };
+        let backend = TestBackend::new(110, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| draw_ui_frame(frame, &model, &wide, &mut hit_regions))
+            .unwrap();
+        let text = terminal_text(&terminal);
+        assert!(text.contains("RUN TELEMETRY"));
+        assert!(text.contains("failed-tool rate"));
+        assert!(text.contains("provider"));
     }
 
     #[test]

@@ -77,6 +77,14 @@ export function memoryEventsPath(workspace = workspaceRoot()): string {
   return join(ensureCache(workspace), "memory-events.jsonl");
 }
 
+export function telemetryPath(workspace = workspaceRoot()): string {
+  return join(ensureCache(workspace), "telemetry.redacted.jsonl");
+}
+
+export function telemetryPolicyPath(workspace = workspaceRoot()): string {
+  return join(ensureCache(workspace), "telemetry-policy.json");
+}
+
 export function tracePath(sessionId: string, workspace = workspaceRoot()): string {
   return join(ensureCache(workspace), "traces", `arc-${safeName(sessionId)}.jsonl`);
 }

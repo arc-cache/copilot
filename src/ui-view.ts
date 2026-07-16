@@ -46,12 +46,33 @@ export function renderArcView(model: ArcUiViewModel, state: ArcUiState, options:
   lines.push(...renderDetail(selected, width, state.mode === "detail" ? 7 : 4));
 
   lines.push("");
+  lines.push("Run metrics");
+  lines.push(fit(`  sessions ${model.metrics.sessionCount} | failed tools ${(model.metrics.failedToolRate * 100).toFixed(1)}% | tokens ${model.metrics.tokens.total} | cost ${costLabel(model)}`, width));
+  lines.push(fit(`  latency p50/p95/p99: model ${percentileLabel(model.metrics.latencyMs.modelFirstResponse)} | tools ${percentileLabel(model.metrics.latencyMs.tool)}`, width));
+  for (const warning of model.metrics.warningMessages.slice(0, 2)) lines.push(fit(`  warning: ${warning}`, width));
+  for (const session of model.metricSessions.slice(0, 3)) {
+    const cost = session.cost.usd === null ? "cost unknown" : `$${session.cost.usd.toFixed(4)} (${session.cost.source})`;
+    const tokens = session.tokens.total === null ? "tokens unknown" : `${session.tokens.total} tokens (${session.tokens.source})`;
+    lines.push(fit(`  ${session.sessionId.slice(0, 10)} | ${session.status} | ${tokens} | ${cost}`, width));
+  }
+
+  lines.push("");
   lines.push("Live feed");
   const feed = model.recentEvents.slice(state.feedOffset, state.feedOffset + feedLimit);
   if (!feed.length) lines.push("  No ARC activity yet. Matching prompts and completed sessions will appear here.");
   for (const event of feed) lines.push(renderEventRow(event, width));
 
   return lines.slice(0, height).map((line) => fit(line, width)).join("\n");
+}
+
+function costLabel(model: ArcUiViewModel): string {
+  return model.metrics.cost.unknownSessions
+    ? `$${model.metrics.cost.knownUsd.toFixed(4)} known + ${model.metrics.cost.unknownSessions} unknown`
+    : `$${model.metrics.cost.knownUsd.toFixed(4)}`;
+}
+
+function percentileLabel(value: { count: number; p50: number | null; p95: number | null; p99: number | null }): string {
+  return value.count ? `${value.p50 ?? "?"}/${value.p95 ?? "?"}/${value.p99 ?? "?"}ms` : "unknown";
 }
 
 export function renderArcStatusSummary(model: ArcUiViewModel): string {
@@ -65,6 +86,7 @@ export function renderArcStatusSummary(model: ArcUiViewModel): string {
     `json hook fallback: ${model.status.hook.installed ? "installed" : "not installed"}`,
     `judge: ${judgeStateLabel(model)}`,
     `events: ${model.status.eventCount}`,
+    `metrics: ${model.metrics.sessionCount} sessions, ${(model.metrics.failedToolRate * 100).toFixed(1)}% failed tools, ${model.metrics.tokens.total} tokens, ${costLabel(model)}`,
     `last injection: ${lastInjection}`,
     `last save: ${lastSave}`
   ].join("\n");

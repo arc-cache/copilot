@@ -56,6 +56,127 @@ fn rust_matches_ts_for_seeded_json_commands() {
 }
 
 #[test]
+fn rust_metrics_and_replay_eval_match_typescript_shapes() {
+    ensure_ts_build();
+    let workspace = tempfile::tempdir().unwrap();
+    let workspace = workspace.path().canonicalize().unwrap();
+    let cache = workspace.join(".agent-run-cache");
+    fs::create_dir_all(cache.join("traces")).unwrap();
+    fs::write(
+        cache.join("telemetry.redacted.jsonl"),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "schemaVersion": 1,
+                "kind": "run",
+                "recordedAt": "2026-01-01T00:00:05.000Z",
+                "runner": "copilot",
+                "sessionId": "metrics-session",
+                "turnId": "metrics-session",
+                "startedAt": "2026-01-01T00:00:00.000Z",
+                "endedAt": "2026-01-01T00:00:05.000Z",
+                "durationMs": 5000,
+                "status": "success",
+                "stopReason": "session completed",
+                "modelLatency": { "firstResponseMs": 500, "totalMs": 5000, "source": "observed" },
+                "tokens": { "inputTokens": 7, "outputTokens": 5, "totalTokens": 12, "source": "provider", "scope": "session" },
+                "cost": { "amount": 0.25, "currency": "USD", "source": "provider", "scope": "session" },
+                "toolCalls": [{
+                    "callId": "safe-call",
+                    "operationFingerprint": "safe-fingerprint",
+                    "name": "shell",
+                    "startedAt": "2026-01-01T00:00:01.000Z",
+                    "durationMs": 2000,
+                    "status": "success",
+                    "attempt": 1,
+                    "retry": false
+                }],
+                "failedToolCount": 0,
+                "retryCount": 0,
+                "retrieval": {
+                    "decision": "injected",
+                    "source": "local",
+                    "capsuleId": "capsule-safe",
+                    "reason": "embedding matched",
+                    "weakMatchCase": false,
+                    "weakMatchAbstention": false,
+                    "capsuleWasStale": false,
+                    "staleCapsuleRejected": false
+                },
+                "warnings": []
+            })
+        ),
+    )
+    .unwrap();
+    fs::write(cache.join("traces/arc-metrics-session.jsonl"), "{}\n").unwrap();
+
+    let ts_metrics = run_ts_json(&["metrics", "--json"], &workspace, None);
+    let rust_metrics = run_rust_json(&["metrics", "--json"], &workspace, None);
+    assert_eq!(rust_metrics["summary"]["latencyMs"], ts_metrics["summary"]["latencyMs"]);
+    assert_eq!(rust_metrics["summary"]["tokens"], ts_metrics["summary"]["tokens"]);
+    assert_eq!(rust_metrics["summary"]["toolCalls"], ts_metrics["summary"]["toolCalls"]);
+    assert_eq!(rust_metrics["sessions"][0]["tokens"], ts_metrics["sessions"][0]["tokens"]);
+    assert_eq!(rust_metrics["summary"]["tokens"]["provider"], 12);
+    assert_eq!(rust_metrics["summary"]["cost"]["providerUsd"], 0.25);
+
+    let ts_eval = run_ts_json(&["replay-eval", "--json"], &workspace, None);
+    let rust_eval = run_rust_json(&["replay-eval", "--json"], &workspace, None);
+    assert_eq!(rust_eval["retrievalPrecision"]["relevant"], ts_eval["retrievalPrecision"]["relevant"]);
+    assert_eq!(rust_eval["retrievalPrecision"]["evaluated"], ts_eval["retrievalPrecision"]["evaluated"]);
+    assert_eq!(rust_eval["retrievalPrecision"]["value"].as_f64(), ts_eval["retrievalPrecision"]["value"].as_f64());
+    assert_eq!(rust_eval["telemetryRedaction"], ts_eval["telemetryRedaction"]);
+    assert_eq!(rust_eval["injectedMemoryOutcome"], ts_eval["injectedMemoryOutcome"]);
+    assert_eq!(rust_eval["retrievalPrecision"]["value"], 1.0);
+
+    let ui = run_rust_json(&["tab", "--json"], &workspace, None);
+    assert_eq!(ui["metrics"]["sessionCount"], 1);
+    assert_eq!(ui["metrics"]["latencyMs"]["tool"]["p50"], 2000);
+}
+
+#[test]
+fn rust_and_typescript_reject_capsules_after_binding_sources_change() {
+    ensure_ts_build();
+    let seed = tempfile::tempdir().unwrap();
+    let seed = seed.path().canonicalize().unwrap();
+    seed_capsule_with_ts(&seed);
+    let memory = seed.join(".agent-run-cache/memory.jsonl");
+    let mut capsule: Value = serde_json::from_str(fs::read_to_string(&memory).unwrap().trim()).unwrap();
+    capsule["bindingSnapshots"] = serde_json::json!([{
+        "source": "test",
+        "exists": true,
+        "hash": "recorded-before-change",
+        "capturedAt": "2026-01-01T00:00:00.000Z"
+    }]);
+    capsule["staleness"] = serde_json::json!({
+        "stale": false,
+        "checkedAt": "2026-01-01T00:00:00.000Z",
+        "reasons": []
+    });
+    fs::write(&memory, format!("{}\n", capsule)).unwrap();
+
+    let ts_workspace = tempfile::tempdir().unwrap();
+    let ts_workspace = ts_workspace.path().canonicalize().unwrap();
+    let rust_workspace = tempfile::tempdir().unwrap();
+    let rust_workspace = rust_workspace.path().canonicalize().unwrap();
+    copy_cache(&seed, &ts_workspace);
+    copy_cache(&seed, &rust_workspace);
+    fs::write(ts_workspace.join("test"), "changed binding source").unwrap();
+    fs::write(rust_workspace.join("test"), "changed binding source").unwrap();
+    let env = [
+        ("AGENT_RUN_CACHE_LOCAL_EMBEDDINGS", "off"),
+        ("AGENT_RUN_CACHE_MODEL_SIDECAR", "off"),
+    ];
+    let prompt = ["probe", "checking", "CLI", "JSON", "output", "--json"];
+    let ts: Value = serde_json::from_str(&run_ts_raw(&prompt, &ts_workspace, None, &env)).unwrap();
+    let rust = run_rust_json_with_env(&prompt, &rust_workspace, None, &env);
+    assert_eq!(ts["shouldInject"], false);
+    assert_eq!(rust["shouldInject"], false);
+    assert!(ts["reason"].as_str().unwrap().contains("stale capsule rejected"));
+    assert_eq!(rust["reason"], ts["reason"]);
+    assert_eq!(rust["capsule"]["staleness"]["stale"], true);
+}
+
+#[test]
 fn rust_declined_list_and_promotion_round_trip() {
     let workspace = tempfile::tempdir().unwrap();
     let workspace = workspace.path().canonicalize().unwrap();
@@ -1100,8 +1221,8 @@ fn rust_ports_logs_debug_bundle_smoke_and_reset_commands() {
         None,
         &[],
     );
-    assert!(ts_output.contains("files: 8, traces: 1"));
-    assert!(rust_output.contains("files: 8, traces: 1"));
+    assert!(ts_output.contains("files: 9, traces: 1"));
+    assert!(rust_output.contains("files: 9, traces: 1"));
     let rust_memory = fs::read_to_string(rust_bundle.join("memory.redacted.jsonl")).unwrap();
     assert!(rust_memory.contains("<token>"));
     assert!(rust_memory.contains("<url>"));
@@ -1113,9 +1234,13 @@ fn rust_ports_logs_debug_bundle_smoke_and_reset_commands() {
     assert!(rust_bundle
         .join("copilot-log-summary.redacted.jsonl")
         .exists());
+    assert!(rust_bundle
+        .join("metrics.aggregate.redacted.json")
+        .exists());
+    assert!(!rust_bundle.join("telemetry.redacted.jsonl").exists());
     let manifest = fs::read_to_string(rust_bundle.join("manifest.json")).unwrap();
     assert!(manifest.contains("\"traceCount\": 1"));
-    assert!(manifest.contains("\"fileCount\": 7"));
+    assert!(manifest.contains("\"fileCount\": 8"));
 
     let smoke_workspace = tempfile::tempdir().unwrap();
     let smoke_workspace = smoke_workspace.path().canonicalize().unwrap();

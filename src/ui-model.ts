@@ -3,6 +3,7 @@ import type { CopilotSdkExtensionStatus } from "./copilot-extension.js";
 import type { ArcIntegration } from "./install.js";
 import type { CapsuleStatus, PrivacyLabel } from "./types.js";
 import type { JudgeReachability } from "./judge-reachability.js";
+import type { MetricsReport } from "./telemetry.js";
 
 export interface ArcUiStatus {
   repo: string;
@@ -60,6 +61,8 @@ export interface ArcUiEventRow {
 
 export interface ArcUiViewModel {
   status: ArcUiStatus;
+  metrics: MetricsReport["summary"];
+  metricSessions: MetricsReport["sessions"];
   query: string;
   capsules: ArcUiCapsuleRow[];
   selectedCapsule: ArcUiCapsuleRow | null;

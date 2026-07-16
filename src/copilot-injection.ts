@@ -49,6 +49,18 @@ export async function buildCopilotPromptInjection(
   const summary = summarizeInjectionPlan(plan);
   if (!plan.shouldInject) {
     await debug("copilot.prompt.no_context", { sessionId, surface, reason: plan.reason }, workspace);
+    await recordMemoryEvent({
+      type: "capsule.retrieval",
+      workspace,
+      sessionId,
+      capsuleId: plan.capsule?.id,
+      details: {
+        decision: "abstained",
+        source: plan.source ?? "unknown",
+        reason: plan.reason,
+        capsuleWasStale: plan.capsule?.staleness?.stale === true
+      }
+    });
     return { hookResult: {}, plan: summary };
   }
   await debug("copilot.prompt.context", { sessionId, surface, reason: plan.reason, source: plan.source }, workspace);
@@ -63,6 +75,8 @@ export async function buildCopilotPromptInjection(
       reason: plan.reason,
       title: plan.capsule?.title,
       injected: true,
+      decision: "injected",
+      capsuleWasStale: plan.capsule?.staleness?.stale === true,
       used: "unknown",
       helped: "unknown",
       judgeDecisionId: plan.judgeDecisionId
