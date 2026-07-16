@@ -758,7 +758,7 @@ async function doctor(args: string[]): Promise<void> {
   console.log(`[OK] workspace: ${workspace}`);
   console.log(`[INFO] integration: ${integration ?? "not activated"}`);
   console.log(`[OK] cache: ${cacheDir(workspace)}`);
-  console.log(`${arcOnPath.found ? "[OK]" : "[WARN]"} arc on PATH: ${arcOnPath.path ?? "not found - install with npm i -g agent-run-cache"}`);
+  console.log(`${arcOnPath.found ? "[OK]" : "[WARN]"} arc on PATH: ${arcOnPath.path ?? "not found - install with npm i -g arc-copilot"}`);
   console.log(`${runtime.transient ? "[WARN]" : "[OK]"} runtime: ${runtime.node} ${runtime.entrypoint}${runtime.transientReason ? ` (${runtime.transientReason})` : ""}`);
   console.log(`[INFO] config: ${arcConfigPath()}`);
   const reachability = judgeReachability(config);

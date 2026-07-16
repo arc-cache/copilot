@@ -31,8 +31,8 @@ export function assertDurableArcRuntime(runtime = currentArcRuntime()): ArcRunti
   if (runtime.transient) {
     throw new Error([
       `ARC was launched from a transient npm cache (${runtime.transientReason}).`,
-      "Install it durably with `npm i -g agent-run-cache`, then run `arc plugin install` again.",
-      "`npx agent-run-cache <cmd>` is only for ad-hoc inspection commands, not persistent hooks."
+      "Install it durably with `npm i -g arc-copilot`, then run `arc plugin install` again.",
+      "`npx arc-copilot <cmd>` is only for ad-hoc inspection commands, not persistent hooks."
     ].join(" "));
   }
   return runtime;

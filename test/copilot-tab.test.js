@@ -179,7 +179,7 @@ function sampleTabModel(label = "initial") {
         doNotReuseWhen: [],
         nextRunInstruction: "Run arc doctor before launching Copilot.",
         steps: ["Install the packed package globally.", "Run arc plugin install.", "Launch Copilot normally."],
-        commands: ["npm i -g agent-run-cache", "arc plugin install"],
+        commands: ["npm i -g arc-copilot", "arc plugin install"],
         validationProbe: [],
         failedAttempts: []
       },

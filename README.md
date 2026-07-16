@@ -9,7 +9,7 @@ back before the next similar run.
 
 ## Install
 
-macOS (Apple silicon or Intel), Node 22+:
+macOS (Apple silicon or Intel), Linux, or Windows with Node 22+:
 
 ```bash
 npm i -g arc-copilot
@@ -17,7 +17,9 @@ arc setup
 arc split
 ```
 
-Linux and Windows builds are coming next.
+The npm package is named `arc-copilot`; it installs both the `arc` and
+`agent-run-cache` commands. Installing `agent-run-cache` as a package returns a
+404 because that is the executable alias, not the package name.
 
 ## What it does
 
