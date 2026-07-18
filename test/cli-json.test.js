@@ -157,7 +157,7 @@ test("transient npm exec runtimes are detected before setup pins hooks", () => {
   assert.equal(transientRuntimeReason("/usr/local/lib/node_modules/agent-run-cache/dist/cli.js"), undefined);
 });
 
-test("transient runtime guidance names the published npm package", () => {
+test("transient runtime guidance uses the migration-aware installer", () => {
   assert.throws(
     () => assertDurableArcRuntime({
       node: process.execPath,
@@ -167,7 +167,7 @@ test("transient runtime guidance names the published npm package", () => {
       transientReason: "/.npm/_npx/"
     }),
     (error) => {
-      assert.match(error.message, /npm i -g arc-copilot/);
+      assert.match(error.message, /github\.com\/arc-cache\/copilot#install-or-upgrade/);
       assert.doesNotMatch(error.message, /npm i -g agent-run-cache/);
       return true;
     }

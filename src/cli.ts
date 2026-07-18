@@ -666,7 +666,7 @@ Usage:
 
 arc opens the terminal UI for the current repo. It shows seam status, capsules, live memory events, and a detail/action pane. If stdout is not a TTY, arc prints a short status summary and exits.
 
-arc plugin install is the normal Copilot setup. It installs ARC's packaged Copilot plugin with supported plugin hooks and the read-only ARC MCP server. After npm i -g arc-copilot, run arc plugin install once, then launch Copilot normally with \`copilot\`. The plugin hooks inject recall through userPromptSubmitted, capture/review at sessionEnd, and auto-create the per-workspace ARC cache on first use. The plugin MCP server exposes arc_search, arc_status, and arc_capsule over stdio.
+arc plugin install is the normal Copilot setup. It installs ARC's packaged Copilot plugin with supported plugin hooks and the read-only ARC MCP server. After installing or upgrading ARC with the migration-aware installer in the README, run arc plugin install once, then launch Copilot normally with \`copilot\`. The plugin hooks inject recall through userPromptSubmitted, capture/review at sessionEnd, and auto-create the per-workspace ARC cache on first use. The plugin MCP server exposes arc_search, arc_status, and arc_capsule over stdio.
 
 arc setup is kept as a compatibility alias for plugin install and optional config persistence. It no longer installs the SDK extension or patches Copilot. The legacy JSON-hook fallback and SDK extension experiment are explicit commands only.
 
@@ -758,7 +758,7 @@ async function doctor(args: string[]): Promise<void> {
   console.log(`[OK] workspace: ${workspace}`);
   console.log(`[INFO] integration: ${integration ?? "not activated"}`);
   console.log(`[OK] cache: ${cacheDir(workspace)}`);
-  console.log(`${arcOnPath.found ? "[OK]" : "[WARN]"} arc on PATH: ${arcOnPath.path ?? "not found - install with npm i -g arc-copilot"}`);
+  console.log(`${arcOnPath.found ? "[OK]" : "[WARN]"} arc on PATH: ${arcOnPath.path ?? "not found - use the install/upgrade command in the README"}`);
   console.log(`${runtime.transient ? "[WARN]" : "[OK]"} runtime: ${runtime.node} ${runtime.entrypoint}${runtime.transientReason ? ` (${runtime.transientReason})` : ""}`);
   console.log(`[INFO] config: ${arcConfigPath()}`);
   const reachability = judgeReachability(config);

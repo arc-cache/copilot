@@ -35,7 +35,7 @@ export function installCopilotPlugin(): CopilotPluginStatus {
       pluginDir,
       installed: false,
       listOutput: "",
-      reason: "arc is not on PATH. Install with npm i -g arc-copilot before installing the Copilot plugin."
+      reason: "arc is not on PATH. Use the migration-aware install/upgrade command in the README before installing the Copilot plugin."
     };
   }
   const result = spawnSync("copilot", ["plugin", "install", pluginDir], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });

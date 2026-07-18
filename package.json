@@ -1,6 +1,6 @@
 {
   "name": "arc-copilot",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Local run cache and terminal companion for GitHub Copilot CLI.",
   "repository": {
     "type": "git",
@@ -27,6 +27,8 @@
     "scripts/install-rust-binary.cjs",
     "scripts/build-release-binaries.cjs",
     "scripts/build-zellij-appliance.cjs",
+    "install.sh",
+    "install.ps1",
     "scripts/verify-rust-local-embeddings.cjs",
     "NOTICE",
     "README.md"
@@ -50,11 +52,11 @@
   },
   "license": "Apache-2.0",
   "optionalDependencies": {
-    "arc-copilot-darwin-arm64": "0.1.7",
-    "arc-copilot-darwin-x64": "0.1.7",
-    "arc-copilot-linux-x64": "0.1.7",
-    "arc-copilot-linux-arm64": "0.1.7",
-    "arc-copilot-windows-x64": "0.1.7"
+    "arc-copilot-darwin-arm64": "0.1.8",
+    "arc-copilot-darwin-x64": "0.1.8",
+    "arc-copilot-linux-x64": "0.1.8",
+    "arc-copilot-linux-arm64": "0.1.8",
+    "arc-copilot-windows-x64": "0.1.8"
   },
   "devDependencies": {
     "@types/node": "^25.9.1",
