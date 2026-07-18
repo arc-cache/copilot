@@ -7,19 +7,38 @@ back before the next similar run.
 [![npm](https://img.shields.io/npm/v/arc-copilot)](https://www.npmjs.com/package/arc-copilot)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-## Install
+## Install or upgrade
 
-macOS (Apple silicon or Intel), Linux, or Windows with Node 22+:
+The installer is the supported route on macOS, Linux, and Windows. It upgrades an existing
+`arc-copilot` install, migrates the old global `agent-run-cache` package, and
+reconciles the earlier `~/.arc-copilot` native install before verifying the new
+binary:
 
 ```bash
-npm i -g arc-copilot
-arc setup
+curl -fsSL https://raw.githubusercontent.com/arc-cache/copilot/main/install.sh | sh
+arc plugin install
 arc split
 ```
 
-The npm package is named `arc-copilot`; it installs both the `arc` and
-`agent-run-cache` commands. Installing `agent-run-cache` as a package returns a
-404 because that is the executable alias, not the package name.
+Windows PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/arc-cache/copilot/main/install.ps1 | iex
+arc plugin install
+arc split
+```
+
+Node 22+ and npm are required. On a clean npm-managed machine, this remains
+equivalent:
+
+```bash
+npm i -g arc-copilot@latest --include=optional
+```
+
+The npm package is named `arc-copilot`; it owns both the `arc` and
+`agent-run-cache` command aliases. ARC Desktop bundles its runtime inside the app
+and never owns these global commands, so Desktop and Copilot can be installed
+together and read the same local `.agent-run-cache` data safely.
 
 ## What it does
 
